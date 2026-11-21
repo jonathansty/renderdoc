@@ -413,6 +413,54 @@ void VulkanRenderState::BindDescriptorBuffers(WrappedVulkan *vk, VkCommandBuffer
   }
 }
 
+bool VulkanRenderState::UsesDescriptorHeaps(WrappedVulkan *vk, bool isCompute) const
+{
+  const VulkanStatePipeline &pipe = isCompute ? compute : graphics;
+
+  if(pipe.shaderObject)
+  {
+    for(uint32_t i = 0; i < NumShaderStages; i++)
+    {
+      if((i == (uint32_t)ShaderStage::Compute) != isCompute)
+        continue;
+
+      if(shaderObjects[i] != ResourceId() &&
+         vk->GetDebugManager()->GetShaderObjectInfo(shaderObjects[i]).descriptorHeap)
+        return true;
+    }
+
+    return false;
+  }
+
+  return pipe.pipeline != ResourceId() &&
+         vk->GetDebugManager()->GetPipelineInfo(pipe.pipeline).descriptorHeap;
+}
+
+void VulkanRenderState::BindDescriptorHeaps(WrappedVulkan *vk, VkCommandBuffer cmd)
+{
+  if(samplerHeap.valid)
+  {
+    VkBindHeapInfoEXT info = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
+    info.heapRange.address = samplerHeap.address;
+    info.heapRange.size = samplerHeap.size;
+    info.reservedRangeOffset = samplerHeap.reservedOffset;
+    info.reservedRangeSize = samplerHeap.reservedSize;
+
+    ObjDisp(cmd)->CmdBindSamplerHeapEXT(Unwrap(cmd), &info);
+  }
+
+  if(resourceHeap.valid)
+  {
+    VkBindHeapInfoEXT info = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
+    info.heapRange.address = resourceHeap.address;
+    info.heapRange.size = resourceHeap.size;
+    info.reservedRangeOffset = resourceHeap.reservedOffset;
+    info.reservedRangeSize = resourceHeap.reservedSize;
+
+    ObjDisp(cmd)->CmdBindResourceHeapEXT(Unwrap(cmd), &info);
+  }
+}
+
 void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
                                      PipelineBinding binding, bool subpass0)
 {
@@ -424,6 +472,7 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
     subpass0 = false;
 
   BindDescriptorBuffers(vk, cmd);
+  BindDescriptorHeaps(vk, cmd);
 
   if(binding == BindGraphics || binding == BindInitial)
   {
@@ -438,18 +487,27 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
 
       ObjDisp(cmd)->CmdBindPipeline(Unwrap(cmd), VK_PIPELINE_BIND_POINT_GRAPHICS, Unwrap(pipe));
 
-      // don't have to handle separate vert/frag layouts as push constant ranges must be identical
-      ResourceId pipeLayoutId = pipeinfo.vertLayout;
-      VkPipelineLayout layout = vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pipeLayoutId);
+      if(pipeinfo.descriptorHeap)
+      {
+        // descriptor heap pipelines have no layout, push data is set instead of push constants
+        BindPushData(cmd);
+      }
+      else
+      {
+        // don't have to handle separate vert/frag layouts as push constant ranges must be identical
+        ResourceId pipeLayoutId = pipeinfo.vertLayout;
+        VkPipelineLayout layout =
+            vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pipeLayoutId);
 
-      const rdcarray<VkPushConstantRange> &pushRanges =
-          vk->GetDebugManager()->GetPipelineLayoutInfo(pipeLayoutId).pushRanges;
+        const rdcarray<VkPushConstantRange> &pushRanges =
+            vk->GetDebugManager()->GetPipelineLayoutInfo(pipeLayoutId).pushRanges;
 
-      // only set push constant ranges that the layout uses
-      for(size_t i = 0; i < pushRanges.size(); i++)
-        ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
-                                       pushRanges[i].offset, pushRanges[i].size,
-                                       pushconsts + pushRanges[i].offset);
+        // only set push constant ranges that the layout uses
+        for(size_t i = 0; i < pushRanges.size(); i++)
+          ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
+                                         pushRanges[i].offset, pushRanges[i].size,
+                                         pushconsts + pushRanges[i].offset);
+      }
     }
     else if(binding == BindInitial)
     {
@@ -476,17 +534,29 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
           Unwrap(cmd), VK_PIPELINE_BIND_POINT_COMPUTE,
           Unwrap(vk->GetResourceManager()->GetHandle<VkPipeline>(compute.pipeline)));
 
-      ResourceId pipeLayoutId = vk->GetDebugManager()->GetPipelineInfo(compute.pipeline).compLayout;
-      VkPipelineLayout layout = vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pipeLayoutId);
+      const VulkanCreationInfo::Pipeline &compInfo =
+          vk->GetDebugManager()->GetPipelineInfo(compute.pipeline);
 
-      const rdcarray<VkPushConstantRange> &pushRanges =
-          vk->GetDebugManager()->GetPipelineLayoutInfo(pipeLayoutId).pushRanges;
+      if(compInfo.descriptorHeap)
+      {
+        // descriptor heap pipelines have no layout, push data is set instead of push constants
+        BindPushData(cmd);
+      }
+      else
+      {
+        ResourceId pipeLayoutId = compInfo.compLayout;
+        VkPipelineLayout layout =
+            vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pipeLayoutId);
 
-      // only set push constant ranges that the layout uses
-      for(size_t i = 0; i < pushRanges.size(); i++)
-        ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
-                                       pushRanges[i].offset, pushRanges[i].size,
-                                       pushconsts + pushRanges[i].offset);
+        const rdcarray<VkPushConstantRange> &pushRanges =
+            vk->GetDebugManager()->GetPipelineLayoutInfo(pipeLayoutId).pushRanges;
+
+        // only set push constant ranges that the layout uses
+        for(size_t i = 0; i < pushRanges.size(); i++)
+          ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
+                                         pushRanges[i].offset, pushRanges[i].size,
+                                         pushconsts + pushRanges[i].offset);
+      }
 
       BindDescriptorSetsForPipeline(vk, cmd, compute, VK_PIPELINE_BIND_POINT_COMPUTE);
     }
@@ -506,17 +576,29 @@ void VulkanRenderState::BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd,
           Unwrap(cmd), VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
           Unwrap(vk->GetResourceManager()->GetHandle<VkPipeline>(rt.pipeline)));
 
-      ResourceId pipeLayoutId = vk->GetDebugManager()->GetPipelineInfo(rt.pipeline).compLayout;
-      VkPipelineLayout layout = vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pipeLayoutId);
+      const VulkanCreationInfo::Pipeline &rtInfo =
+          vk->GetDebugManager()->GetPipelineInfo(rt.pipeline);
 
-      const rdcarray<VkPushConstantRange> &pushRanges =
-          vk->GetDebugManager()->GetPipelineLayoutInfo(pipeLayoutId).pushRanges;
+      if(rtInfo.descriptorHeap)
+      {
+        // descriptor heap pipelines have no layout, push data is set instead of push constants
+        BindPushData(cmd);
+      }
+      else
+      {
+        ResourceId pipeLayoutId = rtInfo.compLayout;
+        VkPipelineLayout layout =
+            vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pipeLayoutId);
 
-      // only set push constant ranges that the layout uses
-      for(size_t i = 0; i < pushRanges.size(); i++)
-        ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
-                                       pushRanges[i].offset, pushRanges[i].size,
-                                       pushconsts + pushRanges[i].offset);
+        const rdcarray<VkPushConstantRange> &pushRanges =
+            vk->GetDebugManager()->GetPipelineLayoutInfo(pipeLayoutId).pushRanges;
+
+        // only set push constant ranges that the layout uses
+        for(size_t i = 0; i < pushRanges.size(); i++)
+          ObjDisp(cmd)->CmdPushConstants(Unwrap(cmd), Unwrap(layout), pushRanges[i].stageFlags,
+                                         pushRanges[i].offset, pushRanges[i].size,
+                                         pushconsts + pushRanges[i].offset);
+      }
 
       BindDescriptorSetsForPipeline(vk, cmd, rt, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
     }
@@ -527,6 +609,7 @@ void VulkanRenderState::BindShaderObjects(WrappedVulkan *vk, VkCommandBuffer cmd
                                           PipelineBinding binding)
 {
   BindDescriptorBuffers(vk, cmd);
+  BindDescriptorHeaps(vk, cmd);
 
   if(binding == BindGraphics || binding == BindInitial)
   {
@@ -1491,9 +1574,27 @@ void VulkanRenderState::SetFramebuffer(WrappedVulkan *vk, ResourceId fb,
   }
 }
 
+void VulkanRenderState::BindPushData(VkCommandBuffer cmd)
+{
+  if(pushConstSize == 0)
+    return;
+
+  VkPushDataInfoEXT info = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+  info.offset = 0;
+  info.data.address = pushconsts;
+  info.data.size = pushConstSize;
+
+  ObjDisp(cmd)->CmdPushDataEXT(Unwrap(cmd), &info);
+}
+
 void VulkanRenderState::BindLastPushConstants(WrappedVulkan *vk, VkCommandBuffer cmd)
 {
-  if(pushLayout != ResourceId())
+  if(pushDataHeap)
+  {
+    // the last push was push data for descriptor heaps, there is no layout
+    BindPushData(cmd);
+  }
+  else if(pushLayout != ResourceId())
   {
     // set push constants with the last layout used
     VkPipelineLayout layout = vk->GetResourceManager()->GetHandle<VkPipelineLayout>(pushLayout);

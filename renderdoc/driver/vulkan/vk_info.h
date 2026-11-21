@@ -31,6 +31,10 @@
 
 struct VulkanCreationInfo;
 
+// returns a pointer to the embedded sampler member for the mapping's source, or NULL if the source
+// doesn't have one
+const VkSamplerCreateInfo **GetDescriptorMappingEmbeddedSampler(VkDescriptorSetAndBindingMappingEXT &mapping);
+
 VkDynamicState ConvertDynamicState(VulkanDynamicStateIndex idx);
 VulkanDynamicStateIndex ConvertDynamicState(VkDynamicState state);
 
@@ -259,6 +263,28 @@ struct VulkanCreationInfo
     VkPipelineRobustnessBufferBehavior uniformBufferRobustness;
     VkPipelineRobustnessImageBehavior imageRobustness;
 
+    // VkShaderDescriptorSetAndBindingMappingInfoEXT - one entry per VkDescriptorSetAndBindingMappingEXT
+    // All data is owned by value so that the entry can be copied freely. Any pointers in
+    // 'mapping' (embedded sampler, pNext) are NULL and the embedded sampler is stored separately.
+    struct DescriptorMapping
+    {
+      VkDescriptorSetAndBindingMappingEXT mapping = {};
+
+      // if set, the mapping source has an embedded sampler which is stored in 'sampler'. Use
+      // GetDescriptorMappingEmbeddedSampler() to find which member to point to it.
+      bool hasEmbeddedSampler = false;
+      VkSamplerCreateInfo sampler = {};
+
+      // the interesting pNext structs of the embedded sampler
+      bool hasBorderColor = false;
+      VkSamplerCustomBorderColorCreateInfoEXT borderColor = {};
+      ResourceId ycbcr;
+    };
+    rdcarray<DescriptorMapping> descriptorMappings;
+
+    // stageOrShaderInfo is a VkPipelineShaderStageCreateInfo or VkShaderCreateInfoEXT
+    void InitDescriptorMappings(const void *stageOrShaderInfo);
+
     bool HasRobustness() const
     {
       return storageBufferRobustness != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT ||
@@ -333,6 +359,9 @@ struct VulkanCreationInfo
 
     // VkPipelineCreateFlags2CreateInfo
     bool useCreateFlags2;
+
+    // VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT
+    bool descriptorHeap = false;
 
     // VkPipelineShaderStageCreateInfo
     ShaderEntry shaders[NumShaderStages];
@@ -493,6 +522,9 @@ struct VulkanCreationInfo
     ShaderEntry shad;
 
     VkShaderCreateFlagsEXT flags;
+
+    // VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT
+    bool descriptorHeap = false;
 
     VkShaderStageFlags nextStage;
 

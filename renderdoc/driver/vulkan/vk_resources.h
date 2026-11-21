@@ -1032,24 +1032,36 @@ DECLARE_REFLECTION_STRUCT(AspectSparseTable);
 struct DescriptorUniquenessKey
 {
   DescriptorUniquenessKey(VkImageLayout layout, VkDescriptorType type)
-      : layout(layout), offset(0), size(0), fmt(VK_FORMAT_UNDEFINED), type(type)
+      : layout(layout), offset(0), size(0), fmt(VK_FORMAT_UNDEFINED), type(type), viewHash(0)
+  {
+  }
+  // used for descriptor heaps, where the image view is not an object but described by a create
+  // info. The hash of that create info forms part of the key
+  DescriptorUniquenessKey(VkImageLayout layout, VkDescriptorType type, uint64_t viewHash)
+      : layout(layout), offset(0), size(0), fmt(VK_FORMAT_UNDEFINED), type(type), viewHash(viewHash)
   {
   }
   DescriptorUniquenessKey(uint64_t offset, uint64_t size, VkFormat fmt, VkDescriptorType type)
-      : layout(VK_IMAGE_LAYOUT_UNDEFINED), offset(offset), size(size), fmt(fmt), type(type)
+      : layout(VK_IMAGE_LAYOUT_UNDEFINED),
+        offset(offset),
+        size(size),
+        fmt(fmt),
+        type(type),
+        viewHash(0)
   {
   }
 
   bool operator==(const DescriptorUniquenessKey &key) const
   {
     return layout == key.layout && offset == key.offset && size == key.size && fmt == key.fmt &&
-           type == key.type;
+           type == key.type && viewHash == key.viewHash;
   }
 
   VkImageLayout layout;
   uint64_t offset, size;
   VkFormat fmt;
   VkDescriptorType type;
+  uint64_t viewHash;
 };
 
 namespace std
@@ -1064,6 +1076,7 @@ struct hash<DescriptorUniquenessKey>
     hash ^= std::hash<uint64_t>()(key.size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     hash ^= std::hash<uint32_t>()(key.fmt) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     hash ^= std::hash<uint32_t>()(key.type) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+    hash ^= std::hash<uint64_t>()(key.viewHash) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
     return hash;
   }
 };

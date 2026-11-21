@@ -1006,6 +1006,9 @@ DECLARE_REFLECTION_STRUCT(DescriptorSetSlot);
 
 constexpr uint64_t FixedOpaqueDescriptorCaptureSize = 16;
 constexpr uint64_t MaxDescriptorSize = 256;
+// number of descriptors worth of space to reserve at the end of the resource heap for RenderDoc's
+// own use, by reducing the reported maxResourceHeapSize
+constexpr uint32_t DescriptorHeapReserveDescriptors = 64;
 // used for calculating how much address space to reserve if it's small and we're worried about
 // expanding descriptor buffers
 constexpr uint32_t ExpectedMaxNumDescriptorBuffers = 100;
@@ -1040,6 +1043,26 @@ struct OpaqueDataForSerialising : VkOpaqueCaptureDescriptorDataCreateInfoEXT
 
   byte data[FixedOpaqueDescriptorCaptureSize] = {};
   size_t sz = 0;
+};
+
+// similar to above but for the opaque capture data of images used with descriptor heaps
+struct HeapOpaqueDataForSerialising : VkOpaqueCaptureDataCreateInfoEXT
+{
+  HeapOpaqueDataForSerialising()
+  {
+    sType = VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT;
+    pNext = NULL;
+    pData = &range;
+    range.address = data;
+  }
+
+  void fillUnwrapped(VkDevice wrappedDevice, VkImage unwrappedImage,
+                     VkPhysicalDeviceDescriptorHeapPropertiesEXT &props);
+
+  void addForSerialising(VkBaseInStructure *serialisedCreateInfo);
+
+  byte data[FixedOpaqueDescriptorCaptureSize] = {};
+  VkHostAddressRangeConstEXT range = {};
 };
 
 // pointers are considered to be 48-bit only, as some descriptors only store those and no-one
@@ -1517,6 +1540,12 @@ enum class VulkanChunk : uint32_t
   vkCreateAccelerationStructure2KHR,
   vkCmdDrawIndexedIndirectCount2KHR,
   vkCmdDrawIndirectCount2KHR,
+  vkWriteSamplerDescriptorsEXT,
+  vkWriteResourceDescriptorsEXT,
+  vkCmdBindSamplerHeapEXT,
+  vkCmdBindResourceHeapEXT,
+  vkCmdPushDataEXT,
+  vkRegisterCustomBorderColorEXT,
   Max,
 };
 
@@ -1659,6 +1688,28 @@ DECLARE_REFLECTION_STRUCT(VkDescriptorAddressInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkDescriptorBufferBindingInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkDescriptorBufferBindingPushDescriptorBufferHandleEXT);
 DECLARE_REFLECTION_STRUCT(VkDescriptorGetInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkBindHeapInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkCommandBufferInheritanceDescriptorHeapInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourceConstantOffsetEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourceHeapDataEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourceIndirectAddressEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourceIndirectIndexArrayEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourceIndirectIndexEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourcePushIndexEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorMappingSourceShaderRecordIndexEXT);
+DECLARE_REFLECTION_STRUCT(VkDescriptorSetAndBindingMappingEXT);
+DECLARE_REFLECTION_STRUCT(VkHostAddressRangeConstEXT);
+DECLARE_REFLECTION_STRUCT(VkHostAddressRangeEXT);
+DECLARE_REFLECTION_STRUCT(VkImageDescriptorInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkOpaqueCaptureDataCreateInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceDescriptorHeapFeaturesEXT);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceDescriptorHeapPropertiesEXT);
+DECLARE_REFLECTION_STRUCT(VkPushDataInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkResourceDescriptorInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkSamplerCustomBorderColorIndexCreateInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkShaderDescriptorSetAndBindingMappingInfoEXT);
+DECLARE_REFLECTION_STRUCT(VkSubsampledImageFormatPropertiesEXT);
+DECLARE_REFLECTION_STRUCT(VkTexelBufferDescriptorInfoEXT);
 DECLARE_REFLECTION_STRUCT(VkDescriptorPoolCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkDescriptorPoolInlineUniformBlockCreateInfo);
 DECLARE_REFLECTION_STRUCT(VkDescriptorSetAllocateInfo);
@@ -1987,6 +2038,7 @@ DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderSubgroupPartitionedFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderSubgroupRotateFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR);
+DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderUntypedPointersFeaturesKHR);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderTerminateInvocationFeatures);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderTileImageFeaturesEXT);
 DECLARE_REFLECTION_STRUCT(VkPhysicalDeviceShaderTileImagePropertiesEXT);
@@ -2264,6 +2316,25 @@ DECLARE_DESERIALISE_TYPE(VkDescriptorAddressInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkDescriptorBufferBindingInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkDescriptorBufferBindingPushDescriptorBufferHandleEXT);
 DECLARE_DESERIALISE_TYPE(VkDescriptorGetInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkBindHeapInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkCommandBufferInheritanceDescriptorHeapInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkDescriptorMappingSourceConstantOffsetEXT);
+DECLARE_DESERIALISE_TYPE(VkDescriptorMappingSourceIndirectIndexArrayEXT);
+DECLARE_DESERIALISE_TYPE(VkDescriptorMappingSourceIndirectIndexEXT);
+DECLARE_DESERIALISE_TYPE(VkDescriptorMappingSourcePushIndexEXT);
+DECLARE_DESERIALISE_TYPE(VkDescriptorMappingSourceShaderRecordIndexEXT);
+DECLARE_DESERIALISE_TYPE(VkDescriptorSetAndBindingMappingEXT);
+DECLARE_DESERIALISE_TYPE(VkHostAddressRangeConstEXT);
+DECLARE_DESERIALISE_TYPE(VkImageDescriptorInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkOpaqueCaptureDataCreateInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceDescriptorHeapFeaturesEXT);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceDescriptorHeapPropertiesEXT);
+DECLARE_DESERIALISE_TYPE(VkPushDataInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkResourceDescriptorInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkSamplerCustomBorderColorIndexCreateInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkShaderDescriptorSetAndBindingMappingInfoEXT);
+DECLARE_DESERIALISE_TYPE(VkSubsampledImageFormatPropertiesEXT);
+DECLARE_DESERIALISE_TYPE(VkTexelBufferDescriptorInfoEXT);
 DECLARE_DESERIALISE_TYPE(VkDescriptorPoolCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkDescriptorPoolInlineUniformBlockCreateInfo);
 DECLARE_DESERIALISE_TYPE(VkDescriptorSetAllocateInfo);
@@ -2588,6 +2659,7 @@ DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderSubgroupPartitionedFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderSubgroupRotateFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR);
+DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderUntypedPointersFeaturesKHR);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderTerminateInvocationFeatures);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderTileImageFeaturesEXT);
 DECLARE_DESERIALISE_TYPE(VkPhysicalDeviceShaderTileImagePropertiesEXT);
@@ -3024,6 +3096,7 @@ DECLARE_REFLECTION_ENUM(VkDefaultVertexAttributeValueKHR);
 DECLARE_REFLECTION_ENUM(VkDependencyFlagBits);
 DECLARE_REFLECTION_ENUM(VkDepthBiasRepresentationEXT);
 DECLARE_REFLECTION_ENUM(VkDescriptorBindingFlagBits);
+DECLARE_REFLECTION_ENUM(VkDescriptorMappingSourceEXT);
 DECLARE_REFLECTION_ENUM(VkDescriptorPoolCreateFlagBits);
 DECLARE_REFLECTION_ENUM(VkDescriptorSetLayoutCreateFlagBits);
 DECLARE_REFLECTION_ENUM(VkDescriptorType);
@@ -3142,6 +3215,7 @@ DECLARE_REFLECTION_ENUM(VkShaderCreateFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkShaderFloatControlsIndependence);
 DECLARE_REFLECTION_ENUM(VkShaderStageFlagBits);
 DECLARE_REFLECTION_ENUM(VkSharingMode);
+DECLARE_REFLECTION_ENUM(VkSpirvResourceTypeFlagBitsEXT);
 DECLARE_REFLECTION_ENUM(VkSparseImageFormatFlagBits);
 DECLARE_REFLECTION_ENUM(VkSparseMemoryBindFlagBits);
 DECLARE_REFLECTION_ENUM(VkStencilFaceFlagBits);

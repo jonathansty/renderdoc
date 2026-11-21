@@ -1607,6 +1607,51 @@ struct ConditionalRendering
 };
 
 DOCUMENT(R"(
+VKDescriptorHeap()
+VKDescriptorHeap(other: VKDescriptorHeap)
+
+A bound descriptor heap, from ``VK_EXT_descriptor_heap``.
+)");
+struct DescriptorHeap
+{
+  DOCUMENT("");
+  DescriptorHeap() = default;
+  DescriptorHeap(const DescriptorHeap &) = default;
+  DescriptorHeap &operator=(const DescriptorHeap &) = default;
+
+  DOCUMENT(R"(The :class:`ResourceId` of the buffer object containing the heap, or a null ID if no
+heap is bound.
+
+:type: ResourceId
+)");
+  ResourceId buffer;
+
+  DOCUMENT(R"(The offset in bytes from the base of the buffer object to the start of the heap.
+
+:type: int
+)");
+  uint64_t offset = 0;
+
+  DOCUMENT(R"(The size of the bound heap in bytes, including the reserved range.
+
+:type: int
+)");
+  uint64_t size = 0;
+
+  DOCUMENT(R"(The offset in bytes from the start of the heap to the start of the reserved range.
+
+:type: int
+)");
+  uint64_t reservedOffset = 0;
+
+  DOCUMENT(R"(The size in bytes of the reserved range.
+
+:type: int
+)");
+  uint64_t reservedSize = 0;
+};
+
+DOCUMENT(R"(
 The full current Vulkan pipeline state.
 )");
 struct State
@@ -1750,6 +1795,18 @@ struct State
 :type: VKConditionalRendering
 )");
   ConditionalRendering conditionalRendering;
+
+  DOCUMENT(R"(The currently bound sampler descriptor heap.
+
+:type: VKDescriptorHeap
+)");
+  DescriptorHeap samplerHeap;
+
+  DOCUMENT(R"(The currently bound resource descriptor heap.
+
+:type: VKDescriptorHeap
+)");
+  DescriptorHeap resourceHeap;
 };
 
 };    // namespace VKPipe
@@ -1757,6 +1814,7 @@ struct State
 DECLARE_REFLECTION_STRUCT(VKPipe::DynamicOffset);
 DECLARE_REFLECTION_STRUCT(VKPipe::DescriptorSet);
 DECLARE_REFLECTION_STRUCT(VKPipe::DescriptorBuffer);
+DECLARE_REFLECTION_STRUCT(VKPipe::DescriptorHeap);
 DECLARE_REFLECTION_STRUCT(VKPipe::Pipeline);
 DECLARE_REFLECTION_STRUCT(VKPipe::IndexBuffer);
 DECLARE_REFLECTION_STRUCT(VKPipe::InputAssembly);

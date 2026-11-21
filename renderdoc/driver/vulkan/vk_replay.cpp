@@ -1277,8 +1277,12 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
       const VulkanCreationInfo::ShaderEntry &shad =
           stage.shaderObject ? c.m_ShaderObject[state.shaderObjects[i]].shad : p.shaders[i];
 
+      // heap pipelines have no layout and so no push constant ranges
+      static const rdcarray<VkPushConstantRange> noPushRanges;
+
       const rdcarray<VkPushConstantRange> &pushRanges =
           stage.shaderObject ? c.m_ShaderObject[state.shaderObjects[i]].pushRanges
+          : p.descriptorHeap ? noPushRanges
                              : c.m_PipelineLayout[p.compLayout].pushRanges;
 
       stage.resourceId = rm->GetUnreplacedID(shad.module);
@@ -1417,8 +1421,12 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
       const VulkanCreationInfo::ShaderEntry &shad =
           stages[i]->shaderObject ? c.m_ShaderObject[state.shaderObjects[i]].shad : p.shaders[i];
 
+      // heap pipelines have no layout and so no push constant ranges
+      static const rdcarray<VkPushConstantRange> noPushRanges;
+
       const rdcarray<VkPushConstantRange> &pushRanges =
           stages[i]->shaderObject ? c.m_ShaderObject[state.shaderObjects[i]].pushRanges
+          : p.descriptorHeap      ? noPushRanges
                                   : c.m_PipelineLayout[p.vertLayout].pushRanges;
 
       stages[i]->resourceId = rm->GetUnreplacedID(shad.module);
@@ -2325,6 +2333,29 @@ void VulkanReplay::SavePipelineState(uint32_t eventId)
 
     // these are not actually pipeline specific but for organisation/ease we store them there
     ret.graphics.descriptorBuffers = ret.compute.descriptorBuffers;
+  }
+
+  // descriptor heaps
+  {
+    const VulkanRenderState::DescriptorHeapBind *srcHeaps[] = {&state.samplerHeap,
+                                                               &state.resourceHeap};
+    VKPipe::DescriptorHeap *dstHeaps[] = {&ret.samplerHeap, &ret.resourceHeap};
+
+    for(size_t i = 0; i < ARRAY_COUNT(srcHeaps); i++)
+    {
+      if(!srcHeaps[i]->valid)
+        continue;
+
+      ResourceId id;
+      uint64_t offs = 0;
+      m_pDriver->GetResIDFromAddr(srcHeaps[i]->address, id, offs);
+
+      dstHeaps[i]->buffer = id;
+      dstHeaps[i]->offset = offs;
+      dstHeaps[i]->size = srcHeaps[i]->size;
+      dstHeaps[i]->reservedOffset = srcHeaps[i]->reservedOffset;
+      dstHeaps[i]->reservedSize = srcHeaps[i]->reservedSize;
+    }
   }
 
   // image layouts

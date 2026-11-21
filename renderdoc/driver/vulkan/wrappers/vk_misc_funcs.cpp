@@ -431,9 +431,9 @@ void WrappedVulkan::vkDestroyImage(VkDevice device, VkImage obj, const VkAllocat
   if(obj == VK_NULL_HANDLE)
     return;
 
-  // with descriptor buffers, extend the lifespan of images to ensure descriptors don't falsely
-  // alias
-  if(DescriptorBuffers())
+  // with descriptor buffers/heaps, extend the lifespan of images to ensure descriptors don't
+  // falsely alias
+  if(DescriptorsInMemory())
   {
     SCOPED_READLOCK(m_CapTransitionLock);
     SCOPED_LOCK(m_DeferredDestructLock);
@@ -1344,9 +1344,9 @@ VkResult WrappedVulkan::vkCreateRenderPass(VkDevice device, const VkRenderPassCr
 {
   VkRenderPassCreateInfo patchedCreateInfo = *pCreateInfo;
 
-  // descriptor buffers intercepts all swapchain images during capture so we change any
+  // descriptor buffers/heaps intercepts all swapchain images during capture so we change any
   // reference to PRESENT layout into GENERAL since that's what is valid for our image
-  if(DescriptorBuffers())
+  if(DescriptorsInMemory())
   {
     byte *tempMem = GetTempMemory(GetNextPatchSize(patchedCreateInfo.pNext));
     CopyNextChainForPatching("VkRenderPassCreateInfo", tempMem,
@@ -1604,9 +1604,9 @@ VkResult WrappedVulkan::vkCreateRenderPass2(VkDevice device,
 {
   VkRenderPassCreateInfo2 patchedCreateInfo = *pCreateInfo;
 
-  // descriptor buffers intercepts all swapchain images during capture so we change any
+  // descriptor buffers/heaps intercepts all swapchain images during capture so we change any
   // reference to PRESENT layout into GENERAL since that's what is valid for our image
-  if(DescriptorBuffers())
+  if(DescriptorsInMemory())
   {
     byte *tempMem = GetTempMemory(GetNextPatchSize(patchedCreateInfo.pNext));
     CopyNextChainForPatching("VkRenderPassCreateInfo2", tempMem,

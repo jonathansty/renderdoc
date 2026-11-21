@@ -5594,6 +5594,13 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
   // get ourselves in pristine state before this action (without any side effects it may have had)
   m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
 
+  // TODO(heap slice 2): descriptors are not resolvable for descriptor heap shaders yet
+  if(state.UsesDescriptorHeaps(m_pDriver, false))
+  {
+    RDCWARN("Vertex debugging is not supported with descriptor heaps");
+    return new ShaderDebugTrace();
+  }
+
   const VulkanCreationInfo::Pipeline &pipe = c.m_Pipeline[state.graphics.pipeline];
   const VulkanCreationInfo::ShaderEntry &shaderEntry =
       state.graphics.shaderObject ? c.m_ShaderObject[state.shaderObjects[0]].shad : pipe.shaders[0];
@@ -6141,6 +6148,13 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
 
   // get ourselves in pristine state before this action (without any side effects it may have had)
   m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
+
+  // TODO(heap slice 2): descriptors are not resolvable for descriptor heap shaders yet
+  if(state.UsesDescriptorHeaps(m_pDriver, false))
+  {
+    RDCWARN("Pixel debugging is not supported with descriptor heaps");
+    return new ShaderDebugTrace();
+  }
 
   const VulkanCreationInfo::ShaderEntry &fragEntry =
       state.graphics.shaderObject ? c.m_ShaderObject[state.shaderObjects[4]].shad : pipe.shaders[4];
@@ -6715,6 +6729,13 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
 
   // get ourselves in pristine state before this dispatch (without any side effects it may have had)
   m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
+
+  if(state.UsesDescriptorHeaps(m_pDriver, stage == ShaderStage::Compute))
+  {
+    // TODO(heap slice 2): descriptors are not resolvable for descriptor heap shaders yet
+    RDCWARN("%s debugging is not supported with descriptor heaps", ToStr(stage).c_str());
+    return new ShaderDebugTrace();
+  }
 
   const VulkanStatePipeline &stagePipeState =
       stage == ShaderStage::Compute ? state.compute : state.graphics;

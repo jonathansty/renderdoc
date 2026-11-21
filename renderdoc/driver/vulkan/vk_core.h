@@ -434,6 +434,7 @@ private:
   };
 
   VkPhysicalDeviceDescriptorBufferPropertiesEXT m_DescriptorBufferProperties;
+  VkPhysicalDeviceDescriptorHeapPropertiesEXT m_DescriptorHeapProperties;
 
   Threading::CriticalSection m_ASLookupByAddrLock;
   rdcflatmap<VkDeviceAddress, ResourceId> m_ASLookupByAddr;
@@ -503,6 +504,14 @@ private:
 
   bool m_NULLDescriptorPatternSaved = false;
   bool m_IgnoreLayoutForDescriptors = false;
+
+  // VK_EXT_descriptor_heap: NULL descriptor patterns can differ per descriptor type, track which
+  // types we've already serialised one for. Also the set of hashes of sampler create infos which
+  // have been serialised, since samplers are not objects and so have no record to track this
+  Threading::CriticalSection m_HeapDescriptorLock;
+  rdcarray<VkDescriptorType> m_NULLHeapDescriptorPatternsSaved;
+  std::unordered_set<uint64_t> m_HeapSamplerHashes;
+  uint32_t HeapDescriptorSize(VkDescriptorType type);
   uint32_t m_ResourceDescriptorBufferReserveSize = 0;
   rdcarray<ResourceId> m_ResourceDescBuffers;
   std::unordered_map<ResourceId, ResourceId> m_InlineBuffers;
@@ -550,6 +559,7 @@ private:
   bool m_Maintenance6 = false;
   bool m_Maintenance9 = false;
   bool m_DescriptorBuffers = false;
+  bool m_DescriptorHeaps = false;
   bool m_MultiviewPerViewViewports = false;
   uint32_t m_PreciseFMAMask = 0;
 
@@ -1550,6 +1560,8 @@ public:
   bool Maintenance6() const { return m_Maintenance6; }
   bool Maintenance9() const { return m_Maintenance9; }
   bool DescriptorBuffers() const { return m_DescriptorBuffers; }
+  bool DescriptorHeaps() const { return m_DescriptorHeaps; }
+  bool DescriptorsInMemory() const { return m_DescriptorBuffers || m_DescriptorHeaps; }
   bool MultiViewGeometryShaders() const { return m_MultiViewGeometryShaders; }
   bool MultiviewPerViewViewports() const { return m_MultiviewPerViewViewports; }
   uint32_t PreciseFMAMask() const { return m_PreciseFMAMask; }
@@ -1578,7 +1590,9 @@ public:
   }
   VkImageCreateFlags DefaultImageCreateFlags()
   {
-    return DescriptorBuffers() ? VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT : 0;
+    // note the heap and buffer flags have the same bit value
+    return (DescriptorBuffers() ? VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT : 0) |
+           (DescriptorHeaps() ? VK_IMAGE_CREATE_DESCRIPTOR_HEAP_CAPTURE_REPLAY_BIT_EXT : 0);
   }
   VkImageViewCreateFlags DefaultImageViewCreateFlags()
   {
@@ -3333,6 +3347,28 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(
       void, vkCmdPushDescriptorSetWithTemplate2, VkCommandBuffer commandBuffer,
       const VkPushDescriptorSetWithTemplateInfo *pPushDescriptorSetWithTemplateInfo);
+
+  // VK_EXT_descriptor_heap
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkWriteSamplerDescriptorsEXT, VkDevice device,
+                                uint32_t samplerCount, const VkSamplerCreateInfo *pSamplers,
+                                const VkHostAddressRangeEXT *pDescriptors);
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkWriteResourceDescriptorsEXT, VkDevice device,
+                                uint32_t resourceCount, const VkResourceDescriptorInfoEXT *pResources,
+                                const VkHostAddressRangeEXT *pDescriptors);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindSamplerHeapEXT, VkCommandBuffer commandBuffer,
+                                const VkBindHeapInfoEXT *pBindInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdBindResourceHeapEXT, VkCommandBuffer commandBuffer,
+                                const VkBindHeapInfoEXT *pBindInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(void, vkCmdPushDataEXT, VkCommandBuffer commandBuffer,
+                                const VkPushDataInfoEXT *pPushDataInfo);
+  IMPLEMENT_FUNCTION_SERIALISED(VkResult, vkRegisterCustomBorderColorEXT, VkDevice device,
+                                const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor,
+                                VkBool32 requestIndex, uint32_t *pIndex);
+  VkResult vkGetImageOpaqueCaptureDataEXT(VkDevice device, uint32_t imageCount,
+                                          const VkImage *pImages, VkHostAddressRangeEXT *pDatas);
+  VkDeviceSize vkGetPhysicalDeviceDescriptorSizeEXT(VkPhysicalDevice physicalDevice,
+                                                    VkDescriptorType descriptorType);
+  void vkUnregisterCustomBorderColorEXT(VkDevice device, uint32_t index);
 
   // VK_EXT_image_drm_format_modifier
   VkResult vkGetImageDrmFormatModifierPropertiesEXT(VkDevice device, VkImage image,

@@ -597,6 +597,74 @@ void VulkanShaderCache::SetPipeCacheBlob(bytebuf &blob)
   m_ShaderCacheDirty = true;
 }
 
+// owns the storage for re-chaining a VkShaderDescriptorSetAndBindingMappingInfoEXT from the stored
+// descriptor mappings of a shader. Used with static instances as with the other create info
+// helpers here, as the create info we return must stay valid after the function returns
+struct DescriptorMappingChain
+{
+  rdcarray<VkDescriptorSetAndBindingMappingEXT> mappings;
+  rdcarray<VkSamplerCreateInfo> samplers;
+  rdcarray<VkSamplerCustomBorderColorCreateInfoEXT> borders;
+  rdcarray<VkSamplerYcbcrConversionInfo> ycbcrs;
+  VkShaderDescriptorSetAndBindingMappingInfoEXT info;
+
+  // returns NULL if the shader has no mappings, otherwise the struct to add to a pNext chain. The
+  // caller is responsible for setting info.pNext
+  VkShaderDescriptorSetAndBindingMappingInfoEXT *Build(
+      VulkanResourceManager *rm, const VulkanCreationInfo::ShaderEntry &shad)
+  {
+    if(shad.descriptorMappings.empty())
+      return NULL;
+
+    const size_t count = shad.descriptorMappings.size();
+
+    // size everything up front so that pointers into the arrays stay valid
+    mappings.resize(count);
+    samplers.resize(count);
+    borders.resize(count);
+    ycbcrs.resize(count);
+
+    for(size_t i = 0; i < count; i++)
+    {
+      const VulkanCreationInfo::ShaderEntry::DescriptorMapping &src = shad.descriptorMappings[i];
+
+      mappings[i] = src.mapping;
+      mappings[i].pNext = NULL;
+
+      if(!src.hasEmbeddedSampler)
+        continue;
+
+      samplers[i] = src.sampler;
+      samplers[i].pNext = NULL;
+
+      if(src.hasBorderColor)
+      {
+        borders[i] = src.borderColor;
+        borders[i].pNext = samplers[i].pNext;
+        samplers[i].pNext = &borders[i];
+      }
+
+      if(src.ycbcr != ResourceId())
+      {
+        ycbcrs[i] = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
+        ycbcrs[i].conversion = rm->GetHandle<VkSamplerYcbcrConversion>(src.ycbcr);
+        ycbcrs[i].pNext = samplers[i].pNext;
+        samplers[i].pNext = &ycbcrs[i];
+      }
+
+      const VkSamplerCreateInfo **embedded = GetDescriptorMappingEmbeddedSampler(mappings[i]);
+      if(embedded)
+        *embedded = &samplers[i];
+    }
+
+    info = {VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
+    info.mappingCount = (uint32_t)count;
+    info.pMappings = mappings.data();
+
+    return &info;
+  }
+};
+
 void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &pipeCreateInfo,
                                                  ResourceId pipeline)
 {
@@ -634,6 +702,7 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
 
   static VkPipelineShaderStageRequiredSubgroupSizeCreateInfo reqSubgroupSize[NumShaderStages] = {};
   static VkPipelineRobustnessCreateInfo shaderRobustness[NumShaderStages] = {};
+  static DescriptorMappingChain heapMappings[NumShaderStages];
 
   // reserve space for spec constants
   for(uint32_t i = 0; i < NumShaderStages; i++)
@@ -656,6 +725,13 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
             VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
         reqSubgroupSize[i].pNext = (void *)stages[stageCount].pNext;
         stages[stageCount].pNext = &reqSubgroupSize[i];
+      }
+
+      if(VkShaderDescriptorSetAndBindingMappingInfoEXT *mappingInfo =
+             heapMappings[i].Build(rm, pipeInfo.shaders[i]))
+      {
+        mappingInfo->pNext = stages[stageCount].pNext;
+        stages[stageCount].pNext = mappingInfo;
       }
 
       if(pipeInfo.shaders[i].HasRobustness())
@@ -1033,8 +1109,13 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
       0,                 // base pipeline index
   };
 
+  // heap pipelines have no layout, and must keep VK_NULL_HANDLE
+  if(pipeInfo.descriptorHeap)
+  {
+    ret.layout = VK_NULL_HANDLE;
+  }
   // if the layouts are the same object (non-library case) we can just use it directly
-  if(pipeInfo.vertLayout == pipeInfo.fragLayout)
+  else if(pipeInfo.vertLayout == pipeInfo.fragLayout)
   {
     ret.layout = rm->GetHandle<VkPipelineLayout>(pipeInfo.vertLayout);
   }
@@ -1272,6 +1353,15 @@ void VulkanShaderCache::MakeComputePipelineInfo(VkComputePipelineCreateInfo &pip
       VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO,
   };
 
+  static DescriptorMappingChain heapMapping;
+
+  if(VkShaderDescriptorSetAndBindingMappingInfoEXT *mappingInfo =
+         heapMapping.Build(rm, pipeInfo.shaders[i]))
+  {
+    mappingInfo->pNext = stage.pNext;
+    stage.pNext = mappingInfo;
+  }
+
   if(pipeInfo.shaders[i].HasRobustness())
   {
     robustness.images = pipeInfo.shaders[i].imageRobustness;
@@ -1286,7 +1376,8 @@ void VulkanShaderCache::MakeComputePipelineInfo(VkComputePipelineCreateInfo &pip
       NULL,
       0,
       stage,
-      rm->GetHandle<VkPipelineLayout>(pipeInfo.compLayout),
+      pipeInfo.descriptorHeap ? VK_NULL_HANDLE
+                              : rm->GetHandle<VkPipelineLayout>(pipeInfo.compLayout),
       VK_NULL_HANDLE,    // base pipeline handle
       0,                 // base pipeline index
   };
@@ -1390,6 +1481,15 @@ void VulkanShaderCache::MakeShaderObjectInfo(VkShaderCreateInfoEXT &shadCreateIn
 
     specInfo.dataSize = specdata.size() * sizeof(uint64_t);
     specInfo.pData = specdata.data();
+  }
+
+  static DescriptorMappingChain heapMapping;
+
+  if(VkShaderDescriptorSetAndBindingMappingInfoEXT *mappingInfo =
+         heapMapping.Build(rm, shadInfo.shad))
+  {
+    mappingInfo->pNext = ret.pNext;
+    ret.pNext = mappingInfo;
   }
 
   static VkCustomResolveCreateInfoEXT customResCreate = {

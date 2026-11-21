@@ -1706,6 +1706,39 @@ bool WrappedVulkan::Serialise_vkBeginCommandBuffer(SerialiserType &ser, VkComman
           {
             m_BakedCmdBufferInfo[BakedCommandBuffer].state.dynamicRendering.active = VK_TRUE;
           }
+
+          const VkCommandBufferInheritanceDescriptorHeapInfoEXT *heapInherit =
+              (const VkCommandBufferInheritanceDescriptorHeapInfoEXT *)FindNextStruct(
+                  BeginInfo.pInheritanceInfo,
+                  VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT);
+
+          if(heapInherit)
+          {
+            VulkanRenderState &inheritState = m_BakedCmdBufferInfo[BakedCommandBuffer].state;
+
+            if(heapInherit->pSamplerHeapBindInfo)
+            {
+              inheritState.samplerHeap.address = heapInherit->pSamplerHeapBindInfo->heapRange.address;
+              inheritState.samplerHeap.size = heapInherit->pSamplerHeapBindInfo->heapRange.size;
+              inheritState.samplerHeap.reservedOffset =
+                  heapInherit->pSamplerHeapBindInfo->reservedRangeOffset;
+              inheritState.samplerHeap.reservedSize =
+                  heapInherit->pSamplerHeapBindInfo->reservedRangeSize;
+              inheritState.samplerHeap.valid = true;
+            }
+
+            if(heapInherit->pResourceHeapBindInfo)
+            {
+              inheritState.resourceHeap.address =
+                  heapInherit->pResourceHeapBindInfo->heapRange.address;
+              inheritState.resourceHeap.size = heapInherit->pResourceHeapBindInfo->heapRange.size;
+              inheritState.resourceHeap.reservedOffset =
+                  heapInherit->pResourceHeapBindInfo->reservedRangeOffset;
+              inheritState.resourceHeap.reservedSize =
+                  heapInherit->pResourceHeapBindInfo->reservedRangeSize;
+              inheritState.resourceHeap.valid = true;
+            }
+          }
         }
 
         ObjDisp(cmd)->BeginCommandBuffer(Unwrap(cmd), &unwrappedBeginInfo);
@@ -4161,6 +4194,7 @@ bool WrappedVulkan::Serialise_vkCmdPushConstants(SerialiserType &ser, VkCommandB
 
         renderstate.pushConstSize = RDCMAX(renderstate.pushConstSize, start + length);
         renderstate.pushLayout = GetResID(layout);
+        renderstate.pushDataHeap = false;
 
         m_PushCommandBuffer = GetResourceManager()->GetUnreplacedID(m_LastCmdBufferID);
       }
@@ -4231,6 +4265,7 @@ bool WrappedVulkan::Serialise_vkCmdPushConstants2(SerialiserType &ser, VkCommand
         renderstate.pushConstSize =
             RDCMAX(renderstate.pushConstSize, PushConstantsInfo.offset + PushConstantsInfo.size);
         renderstate.pushLayout = GetResID(PushConstantsInfo.layout);
+        renderstate.pushDataHeap = false;
 
         m_PushCommandBuffer = GetResourceManager()->GetUnreplacedID(m_LastCmdBufferID);
       }
@@ -9005,6 +9040,214 @@ void WrappedVulkan::vkCmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer commandBu
 }
 
 template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdBindSamplerHeapEXT(SerialiserType &ser, VkCommandBuffer commandBuffer,
+                                                      const VkBindHeapInfoEXT *pBindInfo)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT_LOCAL(BindInfo, *pBindInfo).Named("pBindInfo");
+
+  Serialise_DebugMessages(ser);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(InRerecordRange(m_LastCmdBufferID))
+    {
+      bool loading = IsLoading(m_State);
+      if(!loading)
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+
+      byte *tempMem = GetTempMemory(GetNextPatchSize(&BindInfo));
+      VkBindHeapInfoEXT *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, &BindInfo);
+
+      ObjDisp(commandBuffer)->CmdBindSamplerHeapEXT(Unwrap(commandBuffer), unwrappedInfo);
+
+      {
+        VulkanRenderState::DescriptorHeapBind &heap = GetCmdRenderState().samplerHeap;
+
+        heap.address = BindInfo.heapRange.address;
+        heap.size = BindInfo.heapRange.size;
+        heap.reservedOffset = BindInfo.reservedRangeOffset;
+        heap.reservedSize = BindInfo.reservedRangeSize;
+        heap.valid = true;
+      }
+    }
+  }
+
+  return true;
+}
+
+void WrappedVulkan::vkCmdBindSamplerHeapEXT(VkCommandBuffer commandBuffer,
+                                            const VkBindHeapInfoEXT *pBindInfo)
+{
+  SCOPED_DBG_SINK();
+
+  SERIALISE_TIME_CALL(ObjDisp(commandBuffer)->CmdBindSamplerHeapEXT(Unwrap(commandBuffer), pBindInfo));
+
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+
+    CACHE_THREAD_SERIALISER();
+
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdBindSamplerHeapEXT);
+    Serialise_vkCmdBindSamplerHeapEXT(ser, commandBuffer, pBindInfo);
+
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+
+    // heap buffers are bound by address and are force referenced, but reference it explicitly too
+    ResourceId heapId = GetResIDFromAddr(pBindInfo->heapRange.address);
+    if(heapId != ResourceId())
+      record->MarkResourceFrameReferenced(heapId, eFrameRef_Read);
+  }
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdBindResourceHeapEXT(SerialiserType &ser,
+                                                       VkCommandBuffer commandBuffer,
+                                                       const VkBindHeapInfoEXT *pBindInfo)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT_LOCAL(BindInfo, *pBindInfo).Named("pBindInfo");
+
+  Serialise_DebugMessages(ser);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(InRerecordRange(m_LastCmdBufferID))
+    {
+      bool loading = IsLoading(m_State);
+      if(!loading)
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+
+      byte *tempMem = GetTempMemory(GetNextPatchSize(&BindInfo));
+      VkBindHeapInfoEXT *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, &BindInfo);
+
+      ObjDisp(commandBuffer)->CmdBindResourceHeapEXT(Unwrap(commandBuffer), unwrappedInfo);
+
+      {
+        VulkanRenderState::DescriptorHeapBind &heap = GetCmdRenderState().resourceHeap;
+
+        heap.address = BindInfo.heapRange.address;
+        heap.size = BindInfo.heapRange.size;
+        heap.reservedOffset = BindInfo.reservedRangeOffset;
+        heap.reservedSize = BindInfo.reservedRangeSize;
+        heap.valid = true;
+      }
+    }
+  }
+
+  return true;
+}
+
+void WrappedVulkan::vkCmdBindResourceHeapEXT(VkCommandBuffer commandBuffer,
+                                             const VkBindHeapInfoEXT *pBindInfo)
+{
+  SCOPED_DBG_SINK();
+
+  SERIALISE_TIME_CALL(
+      ObjDisp(commandBuffer)->CmdBindResourceHeapEXT(Unwrap(commandBuffer), pBindInfo));
+
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+
+    CACHE_THREAD_SERIALISER();
+
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdBindResourceHeapEXT);
+    Serialise_vkCmdBindResourceHeapEXT(ser, commandBuffer, pBindInfo);
+
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+
+    // heap buffers are bound by address and are force referenced, but reference it explicitly too
+    ResourceId heapId = GetResIDFromAddr(pBindInfo->heapRange.address);
+    if(heapId != ResourceId())
+      record->MarkResourceFrameReferenced(heapId, eFrameRef_Read);
+  }
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdPushDataEXT(SerialiserType &ser, VkCommandBuffer commandBuffer,
+                                               const VkPushDataInfoEXT *pPushDataInfo)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT_LOCAL(PushDataInfo, *pPushDataInfo).Named("pPushDataInfo");
+
+  Serialise_DebugMessages(ser);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResID(commandBuffer);
+
+    if(InRerecordRange(m_LastCmdBufferID))
+    {
+      bool loading = IsLoading(m_State);
+      if(!loading)
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+
+      byte *tempMem = GetTempMemory(GetNextPatchSize(&PushDataInfo));
+      VkPushDataInfoEXT *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, &PushDataInfo);
+
+      ObjDisp(commandBuffer)->CmdPushDataEXT(Unwrap(commandBuffer), unwrappedInfo);
+
+      {
+        VulkanRenderState &renderstate = GetCmdRenderState();
+
+        // push data shares storage with push constants
+        if((uint64_t)PushDataInfo.offset + PushDataInfo.data.size >
+           (uint64_t)ARRAY_COUNT(renderstate.pushconsts))
+        {
+          RDCERR("Push data of %u bytes at offset %u exceeds supported push constant storage",
+                 (uint32_t)PushDataInfo.data.size, PushDataInfo.offset);
+        }
+        else
+        {
+          memcpy(renderstate.pushconsts + PushDataInfo.offset, PushDataInfo.data.address,
+                 PushDataInfo.data.size);
+
+          renderstate.pushConstSize = RDCMAX(
+              renderstate.pushConstSize, PushDataInfo.offset + (uint32_t)PushDataInfo.data.size);
+          renderstate.pushDataHeap = true;
+
+          m_PushCommandBuffer = GetResourceManager()->GetUnreplacedID(m_LastCmdBufferID);
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+void WrappedVulkan::vkCmdPushDataEXT(VkCommandBuffer commandBuffer,
+                                     const VkPushDataInfoEXT *pPushDataInfo)
+{
+  SCOPED_DBG_SINK();
+
+  SERIALISE_TIME_CALL(ObjDisp(commandBuffer)->CmdPushDataEXT(Unwrap(commandBuffer), pPushDataInfo));
+
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+
+    CACHE_THREAD_SERIALISER();
+
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdPushDataEXT);
+    Serialise_vkCmdPushDataEXT(ser, commandBuffer, pPushDataInfo);
+
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+  }
+}
+
+template <typename SerialiserType>
 bool WrappedVulkan::Serialise_vkCmdBindDescriptorBufferEmbeddedSamplersEXT(
     SerialiserType &ser, VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
     VkPipelineLayout layout, uint32_t set)
@@ -10560,6 +10803,13 @@ INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdSetDescriptorBufferOffsetsEXT,
                                 VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
                                 VkPipelineLayout layout, uint32_t firstSet, uint32_t setCount,
                                 const uint32_t *pBufferIndices, const VkDeviceSize *pOffsets);
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdBindSamplerHeapEXT, VkCommandBuffer commandBuffer,
+                                const VkBindHeapInfoEXT *pBindInfo);
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdBindResourceHeapEXT, VkCommandBuffer commandBuffer,
+                                const VkBindHeapInfoEXT *pBindInfo);
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdPushDataEXT, VkCommandBuffer commandBuffer,
+                                const VkPushDataInfoEXT *pPushDataInfo);
+
 INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdBindDescriptorBufferEmbeddedSamplersEXT,
                                 VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
                                 VkPipelineLayout layout, uint32_t set);

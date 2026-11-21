@@ -1052,6 +1052,26 @@ void WrappedVulkan::vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevi
     descBufferProperties->resourceDescriptorBufferAddressSpaceSize -=
         ExpectedMaxNumDescriptorBuffers * reservedDescriptorSize;
   }
+
+  VkPhysicalDeviceDescriptorHeapPropertiesEXT *descHeapProperties =
+      (VkPhysicalDeviceDescriptorHeapPropertiesEXT *)FindNextStruct(
+          pProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT);
+
+  if(descHeapProperties)
+  {
+    // reserve some room at the end of the resource heap for RenderDoc to place its own descriptors.
+    // We checked at extension filter time that this should be valid
+    const VkDeviceSize reservedHeapSize = AlignUp(
+        VkDeviceSize(DescriptorHeapReserveDescriptors) *
+            RDCMAX(descHeapProperties->imageDescriptorSize, descHeapProperties->bufferDescriptorSize),
+        descHeapProperties->resourceHeapAlignment);
+
+    descHeapProperties->maxResourceHeapSize -= reservedHeapSize;
+
+    // we store push data in the same place as push constants
+    descHeapProperties->maxPushDataSize = RDCMIN(
+        descHeapProperties->maxPushDataSize, (VkDeviceSize)sizeof(VulkanRenderState::pushconsts));
+  }
 }
 
 void WrappedVulkan::vkGetPhysicalDeviceQueueFamilyProperties2(
@@ -1575,6 +1595,26 @@ VkResult WrappedVulkan::vkGetImageOpaqueCaptureDescriptorDataEXT(
 
   return ObjDisp(device)->GetImageOpaqueCaptureDescriptorDataEXT(Unwrap(device), &unwrappedInfo,
                                                                  pData);
+}
+
+VkDeviceSize WrappedVulkan::vkGetPhysicalDeviceDescriptorSizeEXT(VkPhysicalDevice physicalDevice,
+                                                                 VkDescriptorType descriptorType)
+{
+  return ObjDisp(physicalDevice)
+      ->GetPhysicalDeviceDescriptorSizeEXT(Unwrap(physicalDevice), descriptorType);
+}
+
+VkResult WrappedVulkan::vkGetImageOpaqueCaptureDataEXT(VkDevice device, uint32_t imageCount,
+                                                       const VkImage *pImages,
+                                                       VkHostAddressRangeEXT *pDatas)
+{
+  rdcarray<VkImage> unwrappedImages;
+  unwrappedImages.reserve(imageCount);
+  for(uint32_t i = 0; i < imageCount; i++)
+    unwrappedImages.push_back(Unwrap(pImages[i]));
+
+  return ObjDisp(device)->GetImageOpaqueCaptureDataEXT(Unwrap(device), imageCount,
+                                                       unwrappedImages.data(), pDatas);
 }
 
 VkResult WrappedVulkan::vkGetImageViewOpaqueCaptureDescriptorDataEXT(

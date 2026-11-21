@@ -326,7 +326,7 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
           //
           // instead we do the more dangerous thing of adjusting the allocation size to match the
           // image's memory requirements and keep the dedicated allocation.
-          if(AccelerationStructures() || DescriptorBuffers())
+          if(AccelerationStructures() || DescriptorsInMemory())
             patched.allocationSize = mrq.size;
           else
             RemoveNextStruct(&patched, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
@@ -467,7 +467,7 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         };
 
-        if(DescriptorBuffers())
+        if(DescriptorsInMemory())
         {
           bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         }
@@ -551,7 +551,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     };
 
-    if(DescriptorBuffers())
+    if(DescriptorsInMemory())
     {
       bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
       bufInfo.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
@@ -598,7 +598,7 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   // means that when RT is enabled ALL MEMORY IN THE ENTIRE PROGRAM must be marked as BDA just in
   // case.
   bool forceBDA = false;
-  if(IsCaptureMode(m_State) && (AccelerationStructures() || DescriptorBuffers()))
+  if(IsCaptureMode(m_State) && (AccelerationStructures() || DescriptorsInMemory()))
   {
     // force BDA flag when creating, by adding the struct if needed
     forceBDA = true;
@@ -2317,7 +2317,7 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
 
       record->resInfo = NULL;
 
-      if(isSparse || isExternal || m_DescriptorBuffers)
+      if(isSparse || isExternal || DescriptorsInMemory())
       {
         record->resInfo = new ResourceInfo();
 
@@ -3031,6 +3031,16 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
         opaqueData.addForSerialising((VkBaseInStructure *)&serialisedCreateInfo);
       }
 
+      // descriptor heaps use a different struct for the opaque data, so there's no conflict if both
+      // are enabled. We fetch it straight after creation as with descriptor buffers
+      HeapOpaqueDataForSerialising heapOpaqueData;
+
+      if(DescriptorHeaps())
+      {
+        heapOpaqueData.fillUnwrapped(device, Unwrap(*pImage), m_DescriptorHeapProperties);
+        heapOpaqueData.addForSerialising((VkBaseInStructure *)&serialisedCreateInfo);
+      }
+
       {
         CACHE_THREAD_SERIALISER();
 
@@ -3043,9 +3053,9 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
       VkResourceRecord *record = GetResourceManager()->AddResourceRecord(*pImage);
       record->AddChunk(chunk);
 
-      // can't differentiate whether this image will be used with descriptor buffers, must force
-      // reference all images
-      if(DescriptorBuffers())
+      // can't differentiate whether this image will be used with descriptor buffers or heaps, must
+      // force reference all images
+      if(DescriptorsInMemory())
         AddForcedReference(record);
 
       record->resInfo = new ResourceInfo();
@@ -4120,25 +4130,26 @@ VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
 
       GetResourceManager()->MarkDirtyResource(id);
       if(pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
-         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR || DescriptorBuffers())
+         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR || DescriptorsInMemory())
       {
         // We force reference BLASs as it is not feasible to track at the API level which TLASs
         // reference them.  We force ref generics too as they could bottom or top level so we
         // conservatively assume they are bottom
-        // when descriptor buffers are enabled, we must force reference all ASs
+        // when descriptors live in memory, we must force reference all ASs
         AddForcedReference(record);
 
         // in case we're currently capturing, immediately consider the AS as referenced
         GetResourceManager()->MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_Read);
       }
 
+      if(DescriptorsInMemory())
+      {
+        SCOPED_LOCK(m_ASLookupByAddrLock);
+        m_ASLookupByAddr[addr] = id;
+      }
+
       if(m_DescriptorBuffers)
       {
-        {
-          SCOPED_LOCK(m_ASLookupByAddrLock);
-          m_ASLookupByAddr[addr] = id;
-        }
-
         VkDescriptorGetInfoEXT getDesc = {
             VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
         };
@@ -4283,25 +4294,26 @@ VkResult WrappedVulkan::vkCreateAccelerationStructure2KHR(
 
       GetResourceManager()->MarkDirtyResource(id);
       if(pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
-         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR || DescriptorBuffers())
+         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR || DescriptorsInMemory())
       {
         // We force reference BLASs as it is not feasible to track at the API level which TLASs
         // reference them.  We force ref generics too as they could bottom or top level so we
         // conservatively assume they are bottom
-        // when descriptor buffers are enabled, we must force reference all ASs
+        // when descriptors live in memory, we must force reference all ASs
         AddForcedReference(record);
 
         // in case we're currently capturing, immediately consider the AS as referenced
         GetResourceManager()->MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_Read);
       }
 
+      if(DescriptorsInMemory())
+      {
+        SCOPED_LOCK(m_ASLookupByAddrLock);
+        m_ASLookupByAddr[pCreateInfo->addressRange.address] = id;
+      }
+
       if(m_DescriptorBuffers)
       {
-        {
-          SCOPED_LOCK(m_ASLookupByAddrLock);
-          m_ASLookupByAddr[pCreateInfo->addressRange.address] = id;
-        }
-
         VkDescriptorGetInfoEXT getDesc = {
             VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT,
         };

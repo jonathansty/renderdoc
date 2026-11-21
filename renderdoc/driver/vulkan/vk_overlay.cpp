@@ -583,9 +583,15 @@ void VulkanDebugManager::PatchFixedColShaderObject(VkShaderEXT &shad, float col[
   if(patched != 4)
     RDCERR("Didn't patch all constants");
 
+  // the replacement fragment shader doesn't use any descriptors, but all bound shader objects must
+  // agree on whether they use descriptor heaps
+  VkShaderCreateFlagsEXT shaderFlags = 0;
+  if(m_pDriver->m_RenderState.UsesDescriptorHeaps(m_pDriver, false))
+    shaderFlags |= VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT;
+
   VkShaderCreateInfoEXT shadInfo = {VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
                                     NULL,
-                                    0,
+                                    shaderFlags,
                                     VK_SHADER_STAGE_FRAGMENT_BIT,
                                     0,
                                     VK_SHADER_CODE_TYPE_SPIRV_EXT,
@@ -3046,6 +3052,13 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
       CHECK_VKR(m_pDriver, vkr);
     }
   }
+  else if((overlay == DebugOverlay::QuadOverdrawPass || overlay == DebugOverlay::QuadOverdrawDraw) &&
+          state.UsesDescriptorHeaps(m_pDriver, false))
+  {
+    // TODO(heap slice 4): quad overdraw adds a descriptor set to the application's pipeline layout,
+    // which doesn't exist for descriptor heap pipelines
+    RDCWARN("Quad overdraw overlay is not supported with descriptor heaps");
+  }
   else if(overlay == DebugOverlay::QuadOverdrawPass || overlay == DebugOverlay::QuadOverdrawDraw)
   {
     if(m_Overlay.m_QuadResolvePipeline[0] != VK_NULL_HANDLE && !state.rastDiscardEnable &&
@@ -3647,6 +3660,16 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
         RemoveNextStruct(&pipeCreateInfo, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
         // don't use custom resolve
         RemoveNextStruct(&pipeCreateInfo, VK_STRUCTURE_TYPE_CUSTOM_RESOLVE_CREATE_INFO_EXT);
+
+        // we replace all of the shaders and the layout with our own, so this can't be a descriptor
+        // heap pipeline even if the application's was
+        {
+          VkPipelineCreateFlags2CreateInfo *flags2 =
+              (VkPipelineCreateFlags2CreateInfo *)FindNextStruct(
+                  &pipeCreateInfo, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO);
+          if(flags2)
+            flags2->flags &= ~VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+        }
 
         if(pipeCreateInfo.pDynamicState)
         {

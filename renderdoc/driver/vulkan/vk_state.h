@@ -112,6 +112,11 @@ struct VulkanRenderState
   void BindPipeline(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding, bool subpass0);
 
   void BindDescriptorBuffers(WrappedVulkan *vk, VkCommandBuffer cmd);
+  void BindDescriptorHeaps(WrappedVulkan *vk, VkCommandBuffer cmd);
+
+  // returns true if the currently bound graphics or compute pipeline (or any bound shader object
+  // for that bind point) uses descriptor heaps instead of descriptor sets
+  bool UsesDescriptorHeaps(WrappedVulkan *vk, bool isCompute) const;
 
   void BindShaderObjects(WrappedVulkan *vk, VkCommandBuffer cmd, PipelineBinding binding);
   void BindDynamicState(WrappedVulkan *vk, VkCommandBuffer cmd);
@@ -177,6 +182,9 @@ struct VulkanRenderState
   byte pushconsts[1024] = {};
   // the actual number of bytes that have been uploaded
   uint32_t pushConstSize = 0;
+  // true if the last push to pushconsts was vkCmdPushDataEXT (descriptor heaps) rather than push
+  // constants, in which case pushLayout is not relevant
+  bool pushDataHeap = false;
   // the layout last used to push. Used for handling cases where we are rebinding
   // partial/temporarily invalid state like if we are resetting state after a discard pattern and
   // the command buffer has only pushed some constants but not yet bound a pipeline
@@ -235,6 +243,13 @@ struct VulkanRenderState
     ResourceId pushBuffer;
   };
   rdcarray<DescriptorBuffer> descBufs;
+
+  struct DescriptorHeapBind
+  {
+    VkDeviceAddress address = 0;
+    VkDeviceSize size = 0, reservedOffset = 0, reservedSize = 0;
+    bool valid = false;
+  } samplerHeap, resourceHeap;
 
   struct IdxBuffer
   {
@@ -435,4 +450,5 @@ private:
                          VkPipelineBindPoint bindPoint, uint32_t setIndex, uint32_t *dynamicOffsets);
 
   void BindLastPushConstants(WrappedVulkan *vk, VkCommandBuffer cmd);
+  void BindPushData(VkCommandBuffer cmd);
 };

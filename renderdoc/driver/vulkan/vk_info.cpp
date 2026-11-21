@@ -849,6 +849,72 @@ uint32_t GetDescriptorSizeOfBind(VulkanResourceManager *resourceMan,
   return ret;
 }
 
+const VkSamplerCreateInfo **GetDescriptorMappingEmbeddedSampler(VkDescriptorSetAndBindingMappingEXT &mapping)
+{
+  switch(mapping.source)
+  {
+    case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT:
+      return &mapping.sourceData.constantOffset.pEmbeddedSampler;
+    case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT:
+      return &mapping.sourceData.pushIndex.pEmbeddedSampler;
+    case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT:
+      return &mapping.sourceData.indirectIndex.pEmbeddedSampler;
+    case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT:
+      return &mapping.sourceData.indirectIndexArray.pEmbeddedSampler;
+    case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_SHADER_RECORD_INDEX_EXT:
+      return &mapping.sourceData.shaderRecordIndex.pEmbeddedSampler;
+    default: return NULL;
+  }
+}
+
+void VulkanCreationInfo::ShaderEntry::InitDescriptorMappings(const void *stageOrShaderInfo)
+{
+  descriptorMappings.clear();
+
+  const VkShaderDescriptorSetAndBindingMappingInfoEXT *mappingInfo =
+      (const VkShaderDescriptorSetAndBindingMappingInfoEXT *)FindNextStruct(
+          (const VkBaseInStructure *)stageOrShaderInfo, VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT);
+
+  if(!mappingInfo)
+    return;
+
+  descriptorMappings.resize(mappingInfo->mappingCount);
+  for(uint32_t i = 0; i < mappingInfo->mappingCount; i++)
+  {
+    DescriptorMapping &dst = descriptorMappings[i];
+    dst.mapping = mappingInfo->pMappings[i];
+    dst.mapping.pNext = NULL;
+
+    const VkSamplerCreateInfo **embedded = GetDescriptorMappingEmbeddedSampler(dst.mapping);
+    if(embedded && *embedded)
+    {
+      const VkSamplerCreateInfo *src = *embedded;
+
+      dst.hasEmbeddedSampler = true;
+      dst.sampler = *src;
+      dst.sampler.pNext = NULL;
+
+      const VkSamplerCustomBorderColorCreateInfoEXT *border =
+          (const VkSamplerCustomBorderColorCreateInfoEXT *)FindNextStruct(
+              src, VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT);
+      if(border)
+      {
+        dst.hasBorderColor = true;
+        dst.borderColor = *border;
+        dst.borderColor.pNext = NULL;
+      }
+
+      const VkSamplerYcbcrConversionInfo *ycbcr =
+          (const VkSamplerYcbcrConversionInfo *)FindNextStruct(
+              src, VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO);
+      if(ycbcr)
+        dst.ycbcr = GetResID(ycbcr->conversion);
+
+      *embedded = NULL;
+    }
+  }
+}
+
 static void ProcessStaticDescriptorAccess(VulkanResourceManager *resourceMan,
                                           const ShaderReflection *refl, ResourceId specStorage,
                                           rdcarray<DescriptorAccess> &descriptorAccess,
@@ -1106,6 +1172,7 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
                                             const VkShaderCreateInfoEXT *pCreateInfo)
 {
   flags = pCreateInfo->flags;
+  descriptorHeap = (flags & VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT) != 0;
 
   shad.module = id;
 
@@ -1127,6 +1194,8 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   info.m_ShaderModule[id].Init(resourceMan, info, &smInfo);
 
   shad.entryPoint = pCreateInfo->pName;
+
+  shad.InitDescriptorMappings(pCreateInfo);
 
   // descriptor set layouts
   if(pCreateInfo->pSetLayouts)
@@ -1181,6 +1250,11 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   shad.refl = reflData.refl;
   shad.patchData = &reflData.patchData;
 
+  // heap shader objects have no set layouts or push constants, their static descriptor access is
+  // not described by layouts so leave it empty
+  if(descriptorHeap)
+    return;
+
   rdcarray<const DescSetLayout *> setLayoutInfos;
   for(ResourceId setLayout : descSetLayouts)
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
@@ -1198,6 +1272,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
 
   flags = createFlags2 ? createFlags2->flags : pCreateInfo->flags;
   useCreateFlags2 = createFlags2 != NULL;
+  descriptorHeap = (flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT) != 0;
 
   graphicsPipe = true;
 
@@ -1338,6 +1413,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     shad.entryPoint = pCreateInfo->pStages[i].pName;
     shad.stage = ShaderStage(stageIndex);
     shad.flags = pCreateInfo->pStages[i].flags;
+
+    shad.InitDescriptorMappings(&pCreateInfo->pStages[i]);
 
     ShaderModuleReflectionKey key(shad.stage, shad.entryPoint, ResourceId());
 
@@ -1911,6 +1988,16 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     }
   }
 
+  // flags have been merged from any linked libraries
+  descriptorHeap = (flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT) != 0;
+
+  // heap pipelines have no pipeline layout at all, so no set layouts and no static descriptor access
+  if(descriptorHeap)
+  {
+    descSetLayouts.clear();
+    return;
+  }
+
   // calculate descSetLayouts. If only one layout is set, just copy the layouts from it
   if(vertLayout == ResourceId())
   {
@@ -1986,12 +2073,15 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
 
   flags = createFlags2 ? createFlags2->flags : pCreateInfo->flags;
   useCreateFlags2 = createFlags2 != NULL;
+  descriptorHeap = (flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT) != 0;
 
   graphicsPipe = false;
 
   compLayout = GetResID(pCreateInfo->layout);
 
-  descSetLayouts = info.m_PipelineLayout[compLayout].descSetLayouts;
+  // heap pipelines have a NULL layout, don't create an empty entry for it
+  if(!descriptorHeap)
+    descSetLayouts = info.m_PipelineLayout[compLayout].descSetLayouts;
 
   // need to figure out which states are valid to be NULL
 
@@ -2031,6 +2121,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
     shad.entryPoint = pCreateInfo->stage.pName;
     shad.stage = ShaderStage::Compute;
     shad.flags = pCreateInfo->stage.flags;
+
+    shad.InitDescriptorMappings(&pCreateInfo->stage);
 
     ShaderModuleReflectionKey key(ShaderStage::Compute, shad.entryPoint, ResourceId());
 
@@ -2104,6 +2196,10 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
   logicOpEnable = false;
   logicOp = VK_LOGIC_OP_NO_OP;
 
+  // static descriptor access for heap pipelines is not described by layouts
+  if(descriptorHeap)
+    return;
+
   rdcarray<const DescSetLayout *> setLayoutInfos;
   for(ResourceId setLayout : descSetLayouts)
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
@@ -2122,12 +2218,15 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
 
   flags = createFlags2 ? createFlags2->flags : pCreateInfo->flags;
   useCreateFlags2 = createFlags2 != NULL;
+  descriptorHeap = (flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT) != 0;
 
   graphicsPipe = false;
 
   compLayout = GetResID(pCreateInfo->layout);
 
-  descSetLayouts = info.m_PipelineLayout[compLayout].descSetLayouts;
+  // heap pipelines have a NULL layout, don't create an empty entry for it
+  if(!descriptorHeap)
+    descSetLayouts = info.m_PipelineLayout[compLayout].descSetLayouts;
 
   topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   primitiveRestartEnable = false;

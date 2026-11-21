@@ -683,9 +683,15 @@ private:
             rdcspv::Id pointerType = editor.GetIDType(pointer);
             RDCASSERT(pointerType != rdcspv::Id());
             rdcspv::Iter pointerTypeIt = editor.GetID(pointerType);
-            rdcspv::OpTypePointer ptr(pointerTypeIt);
-            if(ptr.storageClass == rdcspv::StorageClass::Uniform ||
-               ptr.storageClass == rdcspv::StorageClass::StorageBuffer)
+            // pointers can be untyped (e.g. descriptor heap access), but the storage class is all we
+            // need either way
+            rdcspv::StorageClass storageClass = rdcspv::StorageClass::Max;
+            if(pointerTypeIt.opcode() == rdcspv::Op::TypeUntypedPointerKHR)
+              storageClass = rdcspv::OpTypeUntypedPointerKHR(pointerTypeIt).storageClass;
+            else
+              storageClass = rdcspv::OpTypePointer(pointerTypeIt).storageClass;
+            if(storageClass == rdcspv::StorageClass::Uniform ||
+               storageClass == rdcspv::StorageClass::StorageBuffer)
             {
               editor.Remove(it);
               modified = true;

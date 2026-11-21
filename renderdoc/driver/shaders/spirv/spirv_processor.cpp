@@ -826,6 +826,16 @@ void Processor::RegisterOp(Iter it)
     if(opdata.op == Op::SpecConstant)
       specConstants.insert(opdata.result);
   }
+  else if(opdata.op == Op::ConstantSizeOfEXT)
+  {
+    // the size of a type is implementation defined (e.g. descriptor sizes) so we can't evaluate it.
+    // Register a placeholder value so that evaluating it doesn't report an unknown constant
+    ShaderVariable v("sizeof", 1, 0, 0, 0);
+    v.columns = 1;
+    v.type = VarType::UInt;
+
+    constants[opdata.result] = {opdata.resultType, opdata.result, v, {}, opdata.op};
+  }
   else if(opdata.op == Op::ConstantDataKHR || opdata.op == Op::SpecConstantDataKHR)
   {
     // this one has complex decoding rules, so we do it by hand.
@@ -1034,7 +1044,8 @@ void Processor::UnregisterOp(Iter it)
           opdata.op == Op::ConstantTrue || opdata.op == Op::ConstantFalse ||
           opdata.op == Op::ConstantComposite || opdata.op == Op::Constant ||
           opdata.op == Op::SpecConstantTrue || opdata.op == Op::SpecConstantFalse ||
-          opdata.op == Op::SpecConstantComposite || opdata.op == Op::SpecConstant)
+          opdata.op == Op::SpecConstantComposite || opdata.op == Op::SpecConstant ||
+          opdata.op == Op::ConstantSizeOfEXT)
   {
     constants.erase(opdata.result);
     specConstants.erase(opdata.result);

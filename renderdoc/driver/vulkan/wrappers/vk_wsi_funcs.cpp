@@ -281,7 +281,7 @@ VkResult WrappedVulkan::vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR 
 
     VkResourceRecord *swapRecord = GetRecord(swapchain);
 
-    const bool fakeBackbuffers = AccelerationStructures() || DescriptorBuffers();
+    const bool fakeBackbuffers = AccelerationStructures() || DescriptorsInMemory();
 
     for(uint32_t i = 0; i < numImages; i++)
     {
@@ -385,11 +385,11 @@ bool WrappedVulkan::Serialise_vkCreateSwapchainKHR(SerialiserType &ser, VkDevice
   rdcarray<uint64_t> imageMemOffsets;
   uint64_t opaqueMemAddress = 0;
 
-  const bool fakeBackbuffers = AccelerationStructures() || DescriptorBuffers();
+  const bool fakeBackbuffers = AccelerationStructures() || DescriptorsInMemory();
 
   if(IsCaptureMode(m_State) && fakeBackbuffers)
   {
-    if(DescriptorBuffers())
+    if(DescriptorsInMemory())
     {
       opaqueDataFetch.resize(NumImages);
       opaqueData.resize(NumImages);
@@ -403,6 +403,18 @@ bool WrappedVulkan::Serialise_vkCreateSwapchainKHR(SerialiserType &ser, VkDevice
         opaqueDataFetch[i].fillUnwrapped(device,
                                          GetRecord(*pSwapChain)->swapInfo->images[i].userSwapImage,
                                          m_DescriptorBufferProperties);
+        opaqueData[i] = opaqueDataFetch[i];
+      }
+      else if(DescriptorHeaps())
+      {
+        // the serialised opaque data struct is a fixed size which is large enough for the heap
+        // opaque data too, so we store it in the same place. On replay we turn it back into the
+        // heap struct
+        HeapOpaqueDataForSerialising heapFetch;
+        heapFetch.fillUnwrapped(device, GetRecord(*pSwapChain)->swapInfo->images[i].userSwapImage,
+                                m_DescriptorHeapProperties);
+        memcpy(opaqueDataFetch[i].data, heapFetch.data, sizeof(heapFetch.data));
+        opaqueDataFetch[i].sz = heapFetch.range.size;
         opaqueData[i] = opaqueDataFetch[i];
       }
       imageMemOffsets[i] = GetRecord(*pSwapChain)->swapInfo->images[i].fakeImageMemoryOffset;
@@ -478,12 +490,27 @@ bool WrappedVulkan::Serialise_vkCreateSwapchainKHR(SerialiserType &ser, VkDevice
     rdcarray<VkImage> ims;
     ims.resize(NumImages);
 
+    // for descriptor heaps, wrap the serialised opaque data in the heap struct
+    VkHostAddressRangeConstEXT heapOpaqueRange = {};
+    VkOpaqueCaptureDataCreateInfoEXT heapOpaque = {
+        VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT,
+        NULL,
+        &heapOpaqueRange,
+    };
+
     for(uint32_t i = 0; i < NumImages; i++)
     {
       if(DescriptorBuffers())
       {
         RDCASSERT(i < opaqueData.size(), i, opaqueData.size());
         imInfo.pNext = &opaqueData[i];
+      }
+      else if(DescriptorHeaps())
+      {
+        RDCASSERT(i < opaqueData.size(), i, opaqueData.size());
+        heapOpaqueRange.address = opaqueData[i].opaqueCaptureDescriptorData;
+        heapOpaqueRange.size = m_DescriptorHeapProperties.imageCaptureReplayOpaqueDataSize;
+        imInfo.pNext = &heapOpaque;
       }
 
       VkResult vkr = ObjDisp(device)->CreateImage(Unwrap(device), &imInfo, NULL, &ims[i]);
@@ -628,7 +655,7 @@ void WrappedVulkan::WrapAndProcessCreatedSwapchain(VkDevice device,
 
     swapInfo.images.resize(numSwapImages);
 
-    const bool fakeBackbuffers = AccelerationStructures() || DescriptorBuffers();
+    const bool fakeBackbuffers = AccelerationStructures() || DescriptorsInMemory();
 
     // create fake images and memory if we're using descriptor buffers so that the user's handles
     // that views and descriptors are created from are replayable
@@ -1160,7 +1187,7 @@ void WrappedVulkan::HandlePresent(VkQueue queue, const VkPresentInfoKHR *pPresen
   {
     uint32_t overlay = RenderDoc::Inst().GetOverlayBits();
 
-    const bool fakeBackbuffers = AccelerationStructures() || DescriptorBuffers();
+    const bool fakeBackbuffers = AccelerationStructures() || DescriptorsInMemory();
 
     if(fakeBackbuffers || (overlay & eRENDERDOC_Overlay_Enabled))
     {

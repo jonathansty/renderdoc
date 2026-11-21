@@ -1169,6 +1169,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_DESCRIPTOR_BUFFER_SPEC_VERSION,
     },
     {
+        VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
+        VK_EXT_DESCRIPTOR_HEAP_SPEC_VERSION,
+    },
+    {
         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
         VK_EXT_DESCRIPTOR_INDEXING_SPEC_VERSION,
     },
@@ -1997,6 +2001,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_SHADER_TERMINATE_INVOCATION_SPEC_VERSION,
     },
     {
+        VK_KHR_SHADER_UNTYPED_POINTERS_EXTENSION_NAME,
+        VK_KHR_SHADER_UNTYPED_POINTERS_SPEC_VERSION,
+    },
+    {
         VK_KHR_SHARED_PRESENTABLE_IMAGE_EXTENSION_NAME,
         VK_KHR_SHARED_PRESENTABLE_IMAGE_SPEC_VERSION,
     },
@@ -2510,6 +2518,62 @@ VkResult WrappedVulkan::FilterDeviceExtensionProperties(VkPhysicalDevice physDev
         return true;
       }
 
+      if(!strcmp(ext.extensionName, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME))
+      {
+        // require GPDP2
+        if(instDevInfo->ext_KHR_get_physical_device_properties2)
+        {
+          VkPhysicalDeviceDescriptorHeapFeaturesEXT heapFeats = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT};
+          VkPhysicalDeviceFeatures2 baseFeats = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+          baseFeats.pNext = &heapFeats;
+          ObjDisp(physDev)->GetPhysicalDeviceFeatures2(Unwrap(physDev), &baseFeats);
+
+          if(!heapFeats.descriptorHeapCaptureReplay)
+          {
+            if(!filterWarned)
+            {
+              RDCWARN(
+                  "VkPhysicalDeviceDescriptorHeapFeaturesEXT.descriptorHeapCaptureReplay "
+                  "is false, can't support capture of VK_EXT_descriptor_heap");
+            }
+            return true;
+          }
+
+          VkPhysicalDeviceDescriptorHeapPropertiesEXT heapProps = {
+              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
+          VkPhysicalDeviceProperties2 baseProps = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+          baseProps.pNext = &heapProps;
+          ObjDisp(physDev)->GetPhysicalDeviceProperties2(Unwrap(physDev), &baseProps);
+
+#define CHECK_HEAP_PROP_SIZE(prop, max)                                                            \
+  if(heapProps.prop > max)                                                                         \
+  {                                                                                                \
+    if(!filterWarned)                                                                              \
+    {                                                                                              \
+      RDCWARN(                                                                                     \
+          "VkPhysicalDeviceDescriptorHeapPropertiesEXT." #prop                                     \
+          " is too large at %llu (must be <= %llu), can't support capture of "                     \
+          "VK_EXT_descriptor_heap",                                                                \
+          (uint64_t)heapProps.prop, (uint64_t)max);                                                \
+    }                                                                                              \
+    return true;                                                                                   \
+  }
+
+          CHECK_HEAP_PROP_SIZE(imageCaptureReplayOpaqueDataSize, FixedOpaqueDescriptorCaptureSize);
+
+          CHECK_HEAP_PROP_SIZE(samplerDescriptorSize, MaxDescriptorSize);
+          CHECK_HEAP_PROP_SIZE(imageDescriptorSize, MaxDescriptorSize);
+          CHECK_HEAP_PROP_SIZE(bufferDescriptorSize, MaxDescriptorSize);
+
+          // supported and all descriptor sizes are sensible
+          return false;
+        }
+
+        // if it wasn't supported, remove the extension
+        return true;
+      }
+
       if(!strcmp(ext.extensionName, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
       {
         // require GPDP2
@@ -2947,8 +3011,8 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
       GetResourceManager()->MarkResourceFrameReferenced(GetResID(swapInfo.images[i].userSwapImage),
                                                         eFrameRef_Read);
 
-    // we're using the fake image for descriptor buffers, which is in layout general not present
-    if(DescriptorBuffers())
+    // we're using the fake image for descriptor buffers/heaps, which is in layout general not present
+    if(DescriptorsInMemory())
       swapLayout = VK_IMAGE_LAYOUT_GENERAL;
   }
   else
@@ -5120,6 +5184,18 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
       return Serialise_vkCmdDrawIndexedIndirectCount2KHR(ser, VK_NULL_HANDLE, NULL);
     case VulkanChunk::vkCmdDrawIndirectCount2KHR:
       return Serialise_vkCmdDrawIndirectCount2KHR(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkWriteSamplerDescriptorsEXT:
+      return Serialise_vkWriteSamplerDescriptorsEXT(ser, VK_NULL_HANDLE, 0, NULL, NULL);
+    case VulkanChunk::vkWriteResourceDescriptorsEXT:
+      return Serialise_vkWriteResourceDescriptorsEXT(ser, VK_NULL_HANDLE, 0, NULL, NULL);
+    case VulkanChunk::vkCmdBindSamplerHeapEXT:
+      return Serialise_vkCmdBindSamplerHeapEXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdBindResourceHeapEXT:
+      return Serialise_vkCmdBindResourceHeapEXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdPushDataEXT:
+      return Serialise_vkCmdPushDataEXT(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkRegisterCustomBorderColorEXT:
+      return Serialise_vkRegisterCustomBorderColorEXT(ser, VK_NULL_HANDLE, NULL, VK_FALSE, NULL);
 
     // chunks that are reserved but not yet serialised
     case VulkanChunk::vkResetCommandPool:

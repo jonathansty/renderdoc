@@ -1219,7 +1219,8 @@ bool WrappedVulkan::Serialise_vkCreateComputePipelines(SerialiserType &ser, VkDe
       if(OrigCreateInfo.basePipelineHandle != VK_NULL_HANDLE)
         DerivedResource(OrigCreateInfo.basePipelineHandle, Pipeline);
     }
-    DerivedResource(OrigCreateInfo.layout, Pipeline);
+    if(OrigCreateInfo.layout != VK_NULL_HANDLE)
+      DerivedResource(OrigCreateInfo.layout, Pipeline);
     if(OrigCreateInfo.stage.module != VK_NULL_HANDLE)
       DerivedResource(OrigCreateInfo.stage.module, Pipeline);
   }
@@ -1298,8 +1299,12 @@ VkResult WrappedVulkan::vkCreateComputePipelines(VkDevice device, VkPipelineCach
           }
         }
 
-        VkResourceRecord *layoutrecord = GetRecord(pCreateInfos[i].layout);
-        record->AddParent(layoutrecord);
+        // descriptor heap pipelines have no layout
+        if(pCreateInfos[i].layout != VK_NULL_HANDLE)
+        {
+          VkResourceRecord *layoutrecord = GetRecord(pCreateInfos[i].layout);
+          record->AddParent(layoutrecord);
+        }
 
         VkResourceRecord *modulerecord = GetRecord(pCreateInfos[i].stage.module);
         if(modulerecord)

@@ -6317,6 +6317,14 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
     return;
   }
 
+  if(state.UsesDescriptorHeaps(m_pDriver, false))
+  {
+    // TODO(heap slice 3): shader patching is not supported for descriptor heap shaders yet
+    RDCWARN("Post-VS data is not supported with descriptor heaps, event %u", eventId);
+    ret.gsout.status = ret.vsout.status = "Mesh output is not supported with descriptor heaps";
+    return;
+  }
+
   const VulkanCreationInfo::Pipeline &pipeInfo = creationInfo.m_Pipeline[state.graphics.pipeline];
 
   if(state.graphics.shaderObject && state.shaderObjects[size_t(ShaderStage::Vertex)] == ResourceId() &&

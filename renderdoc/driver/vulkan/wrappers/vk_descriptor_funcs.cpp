@@ -3696,3 +3696,747 @@ INSTANTIATE_FUNCTION_SERIALISED(void, vkUpdateDescriptorSetWithTemplate, VkDevic
 INSTANTIATE_FUNCTION_SERIALISED(void, vkGetDescriptorEXT, VkDevice device,
                                 const VkDescriptorGetInfoEXT *pDescriptorInfo, size_t dataSize,
                                 void *pDescriptor);
+
+uint32_t WrappedVulkan::HeapDescriptorSize(VkDescriptorType type)
+{
+  return (uint32_t)ObjDisp(m_PhysicalDevice)
+      ->GetPhysicalDeviceDescriptorSizeEXT(Unwrap(m_PhysicalDevice), type);
+}
+
+namespace
+{
+struct DescriptorHasher
+{
+  uint64_t hash = 0xcbf29ce484222325ULL;
+
+  void Add(uint64_t v) { hash ^= v + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2); }
+  void AddFloat(float f)
+  {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    Add(u);
+  }
+};
+
+// Hash everything about an image view create info that affects the descriptor written, except the
+// image itself (which is the record the descriptor is attached to). Returns false if the pNext
+// chain contains a struct we don't know how to hash, in which case the descriptor must not be
+// de-duplicated.
+bool HashImageViewInfo(const VkImageViewCreateInfo &view, uint64_t &outHash)
+{
+  DescriptorHasher h;
+
+  h.Add(view.flags);
+  h.Add(view.viewType);
+  h.Add(view.format);
+  h.Add(view.components.r);
+  h.Add(view.components.g);
+  h.Add(view.components.b);
+  h.Add(view.components.a);
+  h.Add(view.subresourceRange.aspectMask);
+  h.Add(view.subresourceRange.baseMipLevel);
+  h.Add(view.subresourceRange.levelCount);
+  h.Add(view.subresourceRange.baseArrayLayer);
+  h.Add(view.subresourceRange.layerCount);
+
+  for(const VkBaseInStructure *next = (const VkBaseInStructure *)view.pNext; next; next = next->pNext)
+  {
+    h.Add(next->sType);
+
+    switch(next->sType)
+    {
+      case VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO:
+        h.Add(((const VkImageViewUsageCreateInfo *)next)->usage);
+        break;
+      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO:
+        h.Add(std::hash<ResourceId>()(
+            GetResID(((const VkSamplerYcbcrConversionInfo *)next)->conversion)));
+        break;
+      case VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT:
+        h.Add(((const VkImageViewSlicedCreateInfoEXT *)next)->sliceOffset);
+        h.Add(((const VkImageViewSlicedCreateInfoEXT *)next)->sliceCount);
+        break;
+      case VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT:
+        h.AddFloat(((const VkImageViewMinLodCreateInfoEXT *)next)->minLod);
+        break;
+      case VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT:
+        h.Add(((const VkImageViewASTCDecodeModeEXT *)next)->decodeMode);
+        break;
+      default: return false;
+    }
+  }
+
+  outHash = h.hash;
+  return true;
+}
+
+// as above, but for sampler create infos
+bool HashSamplerInfo(const VkSamplerCreateInfo &s, uint64_t &outHash)
+{
+  DescriptorHasher h;
+
+  h.Add(s.flags);
+  h.Add(s.magFilter);
+  h.Add(s.minFilter);
+  h.Add(s.mipmapMode);
+  h.Add(s.addressModeU);
+  h.Add(s.addressModeV);
+  h.Add(s.addressModeW);
+  h.AddFloat(s.mipLodBias);
+  h.Add(s.anisotropyEnable);
+  h.AddFloat(s.maxAnisotropy);
+  h.Add(s.compareEnable);
+  h.Add(s.compareOp);
+  h.AddFloat(s.minLod);
+  h.AddFloat(s.maxLod);
+  h.Add(s.borderColor);
+  h.Add(s.unnormalizedCoordinates);
+
+  for(const VkBaseInStructure *next = (const VkBaseInStructure *)s.pNext; next; next = next->pNext)
+  {
+    h.Add(next->sType);
+
+    switch(next->sType)
+    {
+      case VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO:
+        h.Add(((const VkSamplerReductionModeCreateInfo *)next)->reductionMode);
+        break;
+      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO:
+        h.Add(std::hash<ResourceId>()(
+            GetResID(((const VkSamplerYcbcrConversionInfo *)next)->conversion)));
+        break;
+      case VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT:
+      {
+        const VkSamplerCustomBorderColorCreateInfoEXT *border =
+            (const VkSamplerCustomBorderColorCreateInfoEXT *)next;
+        for(int i = 0; i < 4; i++)
+          h.Add(border->customBorderColor.uint32[i]);
+        h.Add(border->format);
+        break;
+      }
+      case VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_INDEX_CREATE_INFO_EXT:
+        h.Add(((const VkSamplerCustomBorderColorIndexCreateInfoEXT *)next)->index);
+        break;
+      case VK_STRUCTURE_TYPE_SAMPLER_BORDER_COLOR_COMPONENT_MAPPING_CREATE_INFO_EXT:
+      {
+        const VkSamplerBorderColorComponentMappingCreateInfoEXT *mapping =
+            (const VkSamplerBorderColorComponentMappingCreateInfoEXT *)next;
+        h.Add(mapping->components.r);
+        h.Add(mapping->components.g);
+        h.Add(mapping->components.b);
+        h.Add(mapping->components.a);
+        h.Add(mapping->srgb);
+        break;
+      }
+      default: return false;
+    }
+  }
+
+  outHash = h.hash;
+  return true;
+}
+
+rdcstr DescriptorBitDifferences(const byte *capture, const byte *replay, uint64_t dataSize)
+{
+  rdcstr bitDifferences;
+
+  const uint32_t *capU32 = (const uint32_t *)capture;
+  const uint32_t *replayU32 = (const uint32_t *)replay;
+
+  bitDifferences = "Capture:\n";
+  for(uint32_t d = 0; d * 4 < dataSize; d++)
+    bitDifferences += StringFormat::Fmt("%08llx ", capU32[d]);
+  bitDifferences += "\n\n";
+  bitDifferences += "Replay:\n";
+  for(uint32_t d = 0; d * 4 < dataSize; d++)
+    bitDifferences += StringFormat::Fmt("%08llx ", replayU32[d]);
+  bitDifferences += "\n";
+
+  return bitDifferences;
+}
+};
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkWriteSamplerDescriptorsEXT(SerialiserType &ser, VkDevice device,
+                                                           uint32_t samplerCount,
+                                                           const VkSamplerCreateInfo *pSamplers,
+                                                           const VkHostAddressRangeEXT *pDescriptors)
+{
+  // each chunk contains exactly one sampler (samplerCount is always 1 when serialising), the
+  // caller supplies the produced descriptor bytes as pDescriptors[0]
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT_LOCAL(Sampler, *pSamplers).Important();
+
+  void *pDescriptor = NULL;
+  size_t dataSize_ = 0;
+  if(ser.IsWriting())
+  {
+    pDescriptor = pDescriptors->address;
+    dataSize_ = pDescriptors->size;
+  }
+
+  SERIALISE_ELEMENT_LOCAL(dataSize, uint64_t(dataSize_));
+  SERIALISE_ELEMENT_ARRAY(pDescriptor, dataSize_);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    byte *tempMem = GetTempMemory(GetNextPatchSize(&Sampler));
+    VkSamplerCreateInfo *unwrappedSampler = UnwrapStructAndChain(m_State, tempMem, &Sampler);
+
+    uint64_t curDataSize = HeapDescriptorSize(VK_DESCRIPTOR_TYPE_SAMPLER);
+    if(dataSize != curDataSize)
+    {
+      SET_ERROR_RESULT(
+          m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+          "Sampler descriptor changed size, it was %llu bytes during capture but is %llu bytes "
+          "during replay.\n"
+          "\n%s",
+          dataSize, curDataSize, GetPhysDeviceCompatString(false, false).c_str());
+      return false;
+    }
+
+    bytebuf replayDescriptor;
+    replayDescriptor.resize(size_t(dataSize));
+
+    VkHostAddressRangeEXT range = {replayDescriptor.data(), replayDescriptor.size()};
+
+    // verify the descriptor is bitwise identical
+    VkResult vkr =
+        ObjDisp(device)->WriteSamplerDescriptorsEXT(Unwrap(device), 1, unwrappedSampler, &range);
+
+    if(vkr != VK_SUCCESS)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Failed to write sampler descriptor: %s", ToStr(vkr).c_str());
+      return false;
+    }
+
+    if(memcmp(replayDescriptor.data(), pDescriptor, size_t(dataSize)) != 0)
+    {
+      rdcstr bitDifferences =
+          DescriptorBitDifferences((const byte *)pDescriptor, replayDescriptor.data(), dataSize);
+
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                       "Sampler descriptor changed bit pattern.\n"
+                       "\n%s"
+                       "\n%s",
+                       bitDifferences.c_str(), GetPhysDeviceCompatString(false, false).c_str());
+      return false;
+    }
+
+    // TODO(heap slice 2): RegisterDescriptor with a replay-created sampler
+  }
+
+  return true;
+}
+
+VkResult WrappedVulkan::vkWriteSamplerDescriptorsEXT(VkDevice device, uint32_t samplerCount,
+                                                     const VkSamplerCreateInfo *pSamplers,
+                                                     const VkHostAddressRangeEXT *pDescriptors)
+{
+  // as with vkGetDescriptorEXT the user could be writing straight into GPU upload memory which
+  // would be very bad to read back from. We write into temporary memory then memcpy to user memory,
+  // but only for the descriptors we're actually going to serialise.
+  rdcarray<bool> serialise;
+  serialise.resize(samplerCount);
+
+  size_t unwrapSize = 0;
+  for(uint32_t i = 0; i < samplerCount; i++)
+    unwrapSize += GetNextPatchSize(&pSamplers[i]);
+
+  byte *tempMem = GetTempMemory(unwrapSize);
+
+  rdcarray<VkSamplerCreateInfo> unwrapped;
+  unwrapped.reserve(samplerCount);
+  for(uint32_t i = 0; i < samplerCount; i++)
+    unwrapped.push_back(*UnwrapStructAndChain(m_State, tempMem, &pSamplers[i]));
+
+  rdcarray<VkHostAddressRangeEXT> ranges;
+  ranges.assign(pDescriptors, samplerCount);
+
+  const uint32_t descriptorSize = HeapDescriptorSize(VK_DESCRIPTOR_TYPE_SAMPLER);
+
+  bytebuf tempData;
+
+  if(IsCaptureMode(m_State))
+  {
+    uint32_t numSerialise = 0;
+
+    for(uint32_t i = 0; i < samplerCount; i++)
+    {
+      // samplers have no object to track, so use a set of hashes of the create info. If the create
+      // info has anything we can't hash, always serialise it
+      uint64_t hash = 0;
+      bool unique = true;
+      if(HashSamplerInfo(pSamplers[i], hash))
+      {
+        SCOPED_LOCK(m_HeapDescriptorLock);
+        unique = m_HeapSamplerHashes.insert(hash).second;
+      }
+
+      serialise[i] = unique;
+      if(unique)
+        numSerialise++;
+    }
+
+    tempData.resize(size_t(numSerialise) * descriptorSize);
+
+    uint32_t idx = 0;
+    for(uint32_t i = 0; i < samplerCount; i++)
+    {
+      if(serialise[i])
+      {
+        ranges[i].address = tempData.data() + size_t(idx) * descriptorSize;
+        ranges[i].size = descriptorSize;
+        idx++;
+      }
+    }
+  }
+
+  VkResult ret;
+  SERIALISE_TIME_CALL(ret = ObjDisp(device)->WriteSamplerDescriptorsEXT(
+                          Unwrap(device), samplerCount, unwrapped.data(), ranges.data()));
+
+  if(IsCaptureMode(m_State) && ret == VK_SUCCESS)
+  {
+    for(uint32_t i = 0; i < samplerCount; i++)
+    {
+      if(!serialise[i])
+        continue;
+
+      // copy to the user's memory
+      memcpy(pDescriptors[i].address, ranges[i].address, descriptorSize);
+
+      Chunk *chunk = NULL;
+
+      {
+        CACHE_THREAD_SERIALISER();
+
+        SCOPED_SERIALISE_CHUNK(VulkanChunk::vkWriteSamplerDescriptorsEXT);
+        Serialise_vkWriteSamplerDescriptorsEXT(ser, device, 1, &pSamplers[i], &ranges[i]);
+
+        chunk = scope.Get();
+      }
+
+      // samplers have no record of their own, so these live on the device
+      GetRecord(device)->AddChunk(chunk);
+    }
+  }
+
+  return ret;
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkWriteResourceDescriptorsEXT(
+    SerialiserType &ser, VkDevice device, uint32_t resourceCount,
+    const VkResourceDescriptorInfoEXT *pResources, const VkHostAddressRangeEXT *pDescriptors)
+{
+  // each chunk contains exactly one resource (resourceCount is always 1 when serialising), the
+  // caller supplies the produced descriptor bytes as pDescriptors[0]
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT_LOCAL(ResourceInfo, *pResources).Important();
+
+  void *pDescriptor = NULL;
+  size_t dataSize_ = 0;
+  if(ser.IsWriting())
+  {
+    pDescriptor = pDescriptors->address;
+    dataSize_ = pDescriptors->size;
+  }
+
+  SERIALISE_ELEMENT_LOCAL(dataSize, uint64_t(dataSize_));
+  SERIALISE_ELEMENT_ARRAY(pDescriptor, dataSize_);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    byte *tempMem = GetTempMemory(GetNextPatchSize(&ResourceInfo));
+    VkResourceDescriptorInfoEXT *unwrappedInfo =
+        UnwrapStructAndChain(m_State, tempMem, &ResourceInfo);
+
+    uint64_t curDataSize = HeapDescriptorSize(ResourceInfo.type);
+    if(dataSize != curDataSize)
+    {
+      SET_ERROR_RESULT(
+          m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+          "Descriptor of type %s changed size, it was %llu bytes during capture but is %llu bytes "
+          "during replay.\n"
+          "\n%s",
+          ToStr(ResourceInfo.type).c_str(), dataSize, curDataSize,
+          GetPhysDeviceCompatString(false, false).c_str());
+      return false;
+    }
+
+    bytebuf replayDescriptor;
+    replayDescriptor.resize(size_t(dataSize));
+
+    VkHostAddressRangeEXT range = {replayDescriptor.data(), replayDescriptor.size()};
+
+    // verify the descriptor is bitwise identical
+    VkResult vkr =
+        ObjDisp(device)->WriteResourceDescriptorsEXT(Unwrap(device), 1, unwrappedInfo, &range);
+
+    if(vkr != VK_SUCCESS)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Failed to write descriptor of type %s: %s",
+                       ToStr(ResourceInfo.type).c_str(), ToStr(vkr).c_str());
+      return false;
+    }
+
+    if(memcmp(replayDescriptor.data(), pDescriptor, size_t(dataSize)) != 0)
+    {
+      rdcstr bitDifferences =
+          DescriptorBitDifferences((const byte *)pDescriptor, replayDescriptor.data(), dataSize);
+
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                       "Descriptor of type %s changed bit pattern.\n"
+                       "\n%s"
+                       "\n%s",
+                       ToStr(ResourceInfo.type).c_str(), bitDifferences.c_str(),
+                       GetPhysDeviceCompatString(false, false).c_str());
+      return false;
+    }
+
+    // TODO(heap slice 2): RegisterDescriptor with replay-created views / buffers
+  }
+
+  return true;
+}
+
+VkResult WrappedVulkan::vkWriteResourceDescriptorsEXT(VkDevice device, uint32_t resourceCount,
+                                                      const VkResourceDescriptorInfoEXT *pResources,
+                                                      const VkHostAddressRangeEXT *pDescriptors)
+{
+  // see vkGetDescriptorEXT: write into temporary memory and memcpy into user memory only for
+  // descriptors we serialise. Each element is considered independently
+  size_t unwrapSize = 0;
+  for(uint32_t i = 0; i < resourceCount; i++)
+    unwrapSize += GetNextPatchSize(&pResources[i]);
+
+  byte *tempMem = GetTempMemory(unwrapSize);
+
+  rdcarray<VkResourceDescriptorInfoEXT> unwrapped;
+  unwrapped.reserve(resourceCount);
+  for(uint32_t i = 0; i < resourceCount; i++)
+    unwrapped.push_back(*UnwrapStructAndChain(m_State, tempMem, &pResources[i]));
+
+  rdcarray<VkHostAddressRangeEXT> ranges;
+  ranges.assign(pDescriptors, resourceCount);
+
+  rdcarray<VkResourceRecord *> dstRecords;
+  dstRecords.resize(resourceCount);
+
+  bytebuf tempData;
+  rdcarray<uint32_t> descriptorSizes;
+  descriptorSizes.resize(resourceCount);
+
+  if(IsCaptureMode(m_State))
+  {
+    // determine where each descriptor should go, based on the 'primary' resource
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      const VkResourceDescriptorInfoEXT &info = pResources[i];
+      VkResourceRecord *&dstRecord = dstRecords[i];
+
+      // NULL descriptors are saved once per type on the device
+      auto nullDescriptor = [this, &info, &dstRecord]() {
+        SCOPED_LOCK(m_HeapDescriptorLock);
+        if(m_NULLHeapDescriptorPatternsSaved.contains(info.type))
+        {
+          dstRecord = NULL;
+        }
+        else
+        {
+          m_NULLHeapDescriptorPatternsSaved.push_back(info.type);
+          dstRecord = GetRecord(m_Device);
+        }
+      };
+
+      switch(info.type)
+      {
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        {
+          if(info.data.pImage && info.data.pImage->pView &&
+             info.data.pImage->pView->image != VK_NULL_HANDLE)
+          {
+            // there's no view object, the descriptor is attached to the image
+            dstRecord = GetRecord(info.data.pImage->pView->image);
+
+            // heaps don't ignore the layout
+            uint64_t viewHash = 0;
+            bool hashable = HashImageViewInfo(*info.data.pImage->pView, viewHash);
+
+            if(dstRecord && dstRecord->resInfo && hashable)
+            {
+              DescriptorUniquenessKey descKey(info.data.pImage->layout, info.type, viewHash);
+
+              // this is internally locked
+              if(!dstRecord->resInfo->AddDescriptor(descKey))
+                dstRecord = NULL;
+            }
+            // if we can't hash the view create info, serialise it unconditionally
+          }
+          else
+          {
+            nullDescriptor();
+          }
+          break;
+        }
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        {
+          const bool texel = info.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                             info.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+
+          VkDeviceAddressRangeEXT range = {};
+          VkFormat fmt = VK_FORMAT_UNDEFINED;
+
+          if(texel)
+          {
+            if(info.data.pTexelBuffer)
+            {
+              range = info.data.pTexelBuffer->addressRange;
+              fmt = info.data.pTexelBuffer->format;
+            }
+          }
+          else if(info.data.pAddressRange)
+          {
+            range = *info.data.pAddressRange;
+          }
+
+          if(range.address == 0)
+          {
+            nullDescriptor();
+            break;
+          }
+
+          if(Vulkan_Debug_DangerousDescriptorSerialisation() == 122333)
+          {
+            if(!texel)
+            {
+              dstRecord = NULL;
+              break;
+            }
+
+            // serialise any one random descriptor per unique format so the tracking on replay
+            // still works
+            SCOPED_LOCK(m_DescriptorLookup.lock);
+            if(m_DescriptorLookup.texelFormats.contains(fmt))
+            {
+              dstRecord = NULL;
+              break;
+            }
+            m_DescriptorLookup.texelFormats.push_back(fmt);
+          }
+
+          ResourceId id;
+          uint64_t offs = 0;
+          GetResIDFromAddr(range.address, id, offs);
+
+          dstRecord = GetResourceManager()->GetResourceRecord(id);
+
+          if(dstRecord && dstRecord->resInfo)
+          {
+            DescriptorUniquenessKey descKey(offs, range.size, fmt, info.type);
+
+            // this is internally locked
+            if(!dstRecord->resInfo->AddDescriptor(descKey))
+              dstRecord = NULL;
+          }
+          break;
+        }
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+        {
+          if(info.data.pAddressRange && info.data.pAddressRange->address)
+          {
+            ResourceId id;
+            {
+              SCOPED_LOCK(m_ASLookupByAddrLock);
+              id = m_ASLookupByAddr[info.data.pAddressRange->address];
+            }
+
+            dstRecord = GetResourceManager()->GetResourceRecord(id);
+
+            if(dstRecord && dstRecord->accelerationStructureInfo)
+            {
+              // don't need to worry about the race here, worst case we save an extra descriptor
+              if(dstRecord->hasDescriptorSaved)
+                dstRecord = NULL;
+              else
+                dstRecord->hasDescriptorSaved = true;
+            }
+            else
+            {
+              // we didn't find the AS by address, fall back to the backing buffer so that the
+              // descriptor is at least kept alive
+              uint64_t offs = 0;
+              GetResIDFromAddr(info.data.pAddressRange->address, id, offs);
+
+              dstRecord = GetResourceManager()->GetResourceRecord(id);
+
+              if(dstRecord && dstRecord->resInfo)
+              {
+                DescriptorUniquenessKey descKey(offs, info.data.pAddressRange->size,
+                                                VK_FORMAT_UNDEFINED, info.type);
+
+                if(!dstRecord->resInfo->AddDescriptor(descKey))
+                  dstRecord = NULL;
+              }
+            }
+          }
+          else
+          {
+            nullDescriptor();
+          }
+          break;
+        }
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV:
+        case VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM:
+        case VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM:
+        case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
+        case VK_DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV:
+        case VK_DESCRIPTOR_TYPE_TENSOR_ARM:
+        case VK_DESCRIPTOR_TYPE_MAX_ENUM:
+          RDCERR("Invalid descriptor type passed to vkWriteResourceDescriptorsEXT");
+          break;
+      }
+    }
+
+    // redirect the descriptors we're going to serialise to temporary memory
+    size_t totalSize = 0;
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      if(dstRecords[i])
+      {
+        descriptorSizes[i] = HeapDescriptorSize(pResources[i].type);
+        totalSize += descriptorSizes[i];
+      }
+    }
+
+    tempData.resize(totalSize);
+
+    size_t offs = 0;
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      if(dstRecords[i])
+      {
+        ranges[i].address = tempData.data() + offs;
+        ranges[i].size = descriptorSizes[i];
+        offs += descriptorSizes[i];
+      }
+    }
+  }
+
+  VkResult ret;
+  SERIALISE_TIME_CALL(ret = ObjDisp(device)->WriteResourceDescriptorsEXT(
+                          Unwrap(device), resourceCount, unwrapped.data(), ranges.data()));
+
+  if(IsCaptureMode(m_State) && ret == VK_SUCCESS)
+  {
+    for(uint32_t i = 0; i < resourceCount; i++)
+    {
+      if(!dstRecords[i])
+        continue;
+
+      // copy to the user's memory
+      memcpy(pDescriptors[i].address, ranges[i].address, descriptorSizes[i]);
+
+      Chunk *chunk = NULL;
+
+      {
+        CACHE_THREAD_SERIALISER();
+
+        SCOPED_SERIALISE_CHUNK(VulkanChunk::vkWriteResourceDescriptorsEXT);
+        Serialise_vkWriteResourceDescriptorsEXT(ser, device, 1, &pResources[i], &ranges[i]);
+
+        chunk = scope.Get();
+      }
+
+      dstRecords[i]->AddChunk(chunk);
+    }
+  }
+
+  return ret;
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkRegisterCustomBorderColorEXT(
+    SerialiserType &ser, VkDevice device, const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor,
+    VkBool32 requestIndex, uint32_t *pIndex)
+{
+  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT_LOCAL(BorderColor, *pBorderColor);
+  SERIALISE_ELEMENT_LOCAL(Index, *pIndex);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    uint32_t index = Index;
+    VkResult vkr =
+        ObjDisp(device)->RegisterCustomBorderColorEXT(Unwrap(device), &BorderColor, VK_TRUE, &index);
+
+    if(vkr != VK_SUCCESS)
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Failed to register custom border colour at index %u: %s", Index,
+                       ToStr(vkr).c_str());
+      return false;
+    }
+  }
+
+  return true;
+}
+
+VkResult WrappedVulkan::vkRegisterCustomBorderColorEXT(
+    VkDevice device, const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor,
+    VkBool32 requestIndex, uint32_t *pIndex)
+{
+  VkResult ret;
+  SERIALISE_TIME_CALL(ret = ObjDisp(device)->RegisterCustomBorderColorEXT(
+                          Unwrap(device), pBorderColor, requestIndex, pIndex));
+
+  if(IsCaptureMode(m_State) && ret == VK_SUCCESS)
+  {
+    CACHE_THREAD_SERIALISER();
+
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkRegisterCustomBorderColorEXT);
+    Serialise_vkRegisterCustomBorderColorEXT(ser, device, pBorderColor, requestIndex, pIndex);
+
+    // custom border colours are device-wide state. Device record chunks are written in the
+    // capture's initialisation section, so this is replayed before any frame
+    GetRecord(device)->AddChunk(scope.Get());
+  }
+
+  return ret;
+}
+
+void WrappedVulkan::vkUnregisterCustomBorderColorEXT(VkDevice device, uint32_t index)
+{
+  ObjDisp(device)->UnregisterCustomBorderColorEXT(Unwrap(device), index);
+}
+
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkWriteSamplerDescriptorsEXT, VkDevice device,
+                                uint32_t samplerCount, const VkSamplerCreateInfo *pSamplers,
+                                const VkHostAddressRangeEXT *pDescriptors);
+
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkWriteResourceDescriptorsEXT, VkDevice device,
+                                uint32_t resourceCount, const VkResourceDescriptorInfoEXT *pResources,
+                                const VkHostAddressRangeEXT *pDescriptors);
+
+INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkRegisterCustomBorderColorEXT, VkDevice device,
+                                const VkSamplerCustomBorderColorCreateInfoEXT *pBorderColor,
+                                VkBool32 requestIndex, uint32_t *pIndex);

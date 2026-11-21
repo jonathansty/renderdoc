@@ -1199,6 +1199,38 @@ void OpaqueDataForSerialising::addForSerialising(VkBaseInStructure *serialisedCr
   }
 }
 
+void HeapOpaqueDataForSerialising::fillUnwrapped(VkDevice wrappedDevice, VkImage unwrappedImage,
+                                                 VkPhysicalDeviceDescriptorHeapPropertiesEXT &props)
+{
+  range.size = props.imageCaptureReplayOpaqueDataSize;
+
+  // the spec requires the size to exactly match imageCaptureReplayOpaqueDataSize
+  VkHostAddressRangeEXT dst = {data, (size_t)props.imageCaptureReplayOpaqueDataSize};
+
+  VkResult opaqueQuery =
+      ObjDisp(wrappedDevice)
+          ->GetImageOpaqueCaptureDataEXT(Unwrap(wrappedDevice), 1, &unwrappedImage, &dst);
+  if(opaqueQuery != VK_SUCCESS)
+    RDCERR("Couldn't get opaque capture/replay data: %s", ToStr(opaqueQuery).c_str());
+}
+
+void HeapOpaqueDataForSerialising::addForSerialising(VkBaseInStructure *serialisedCreateInfo)
+{
+  VkOpaqueCaptureDataCreateInfoEXT *existing = (VkOpaqueCaptureDataCreateInfoEXT *)FindNextStruct(
+      serialisedCreateInfo, VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DATA_CREATE_INFO_EXT);
+
+  if(existing)
+  {
+    RDCASSERT(existing->pData && existing->pData->size == range.size &&
+              memcmp(data, existing->pData->address, range.size) == 0);
+  }
+  else
+  {
+    pNext = serialisedCreateInfo->pNext;
+    serialisedCreateInfo->pNext = (VkBaseInStructure *)this;
+  }
+}
+
 void GetPhysicalDeviceDriverProperties(VkInstDispatchTable *instDispatchTable,
                                        VkPhysicalDevice unwrappedPhysicalDevice,
                                        VkPhysicalDeviceDriverProperties &driverProps)

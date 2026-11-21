@@ -1526,6 +1526,14 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
     return false;
   }
 
+  if(state.UsesDescriptorHeaps(m_pDriver, result.compute))
+  {
+    // TODO(heap slice 3): shader patching is not supported for descriptor heap shaders yet
+    RDCWARN("Bindless feedback is not supported with descriptor heaps, event %u", eventId);
+    result.valid = true;
+    return false;
+  }
+
   const VulkanCreationInfo::Pipeline &pipeInfo = creationInfo.m_Pipeline[pipe.pipeline];
 
   const VulkanCreationInfo::ShaderEntry *shaderEntries[NumShaderStages] = {};
