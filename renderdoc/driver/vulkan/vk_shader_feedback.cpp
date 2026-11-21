@@ -1526,10 +1526,16 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
     return false;
   }
 
-  if(state.UsesDescriptorHeaps(m_pDriver, result.compute))
+  const bool usesHeaps = state.UsesDescriptorHeaps(m_pDriver, result.compute);
+
+  if(usesHeaps && !IsBDA(m_StorageMode))
   {
-    // TODO(heap slice 3): shader patching is not supported for descriptor heap shaders yet
-    RDCWARN("Bindless feedback is not supported with descriptor heaps, event %u", eventId);
+    // heap pipelines have no pipeline layout so we can't add a descriptor set for our feedback
+    // buffer, it can only be passed by address
+    RDCWARN(
+        "Bindless feedback is not supported with descriptor heaps without buffer device address, "
+        "event %u",
+        eventId);
     result.valid = true;
     return false;
   }
@@ -1613,12 +1619,17 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
       }
     }
 
-    auto processBinding = [this, &shaderObject, &descLayouts, &stageDescLayouts, &descBufs,
-                           &descSets, &feedbackData](
+    auto processBinding = [this, usesHeaps, &shaderObject, &descLayouts, &stageDescLayouts,
+                           &descBufs, &descSets, &feedbackData](
                               ShaderStage stage, DescriptorType type, bool inputAttachment,
                               uint16_t index, uint32_t bindset, uint32_t bind, uint32_t arraySize) {
       // only process array bindings
       if(arraySize <= 1)
+        return;
+
+      // heap pipelines have no descriptor set layouts to resolve array bindings against
+      // TODO(heap 2.3): arrays in set/binding mappings are not supported, only direct heap access
+      if(usesHeaps)
         return;
 
       rdcarray<const DescSetLayout *> &descSetLayouts =
@@ -1753,7 +1764,8 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
   feedbackData.feedbackStorageSize += 128;
 
   // if we don't have any array descriptors or printf's to feedback then just return now
-  if(feedbackData.offsetMap.empty() && !usesPrintf)
+  // heap pipelines always run, as they can access the heap directly without any declared binding
+  if(feedbackData.offsetMap.empty() && !usesPrintf && !usesHeaps)
   {
     return false;
   }

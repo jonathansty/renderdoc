@@ -124,6 +124,10 @@ void main()
     devExts.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     devExts.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
 
+    // RenderDoc's shader patching for feedback needs to be able to write from graphics stages
+    optFeatures.vertexPipelineStoresAndAtomics = VK_TRUE;
+    optFeatures.fragmentStoresAndAtomics = VK_TRUE;
+
     VulkanGraphicsTest::Prepare(argc, argv);
 
     if(!Avail.empty())

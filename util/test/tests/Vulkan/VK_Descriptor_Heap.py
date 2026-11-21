@@ -5,6 +5,12 @@ import rdtest
 class VK_Descriptor_Heap(rdtest.TestCase):
     demos_test_name = 'VK_Descriptor_Heap'
 
+    def get_replay_options(self):
+        opts = rdtest.TestCase.get_replay_options(self)
+        # patched pipelines used by feedback must not generate validation errors
+        opts.apiValidation = True
+        return opts
+
     def check_capture(self):
         # each test draws into its own viewport. Each entry is a list of (x fraction, y fraction, colour) to check
         # within that viewport. The tests that scale the UVs by 2 hit the sampler's border colour in the upper right
@@ -49,6 +55,10 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
             eid = draw.eventId
 
+            # drain messages from the replay so far, so we only see ones from this event's replay + feedback
+            self.controller.GetDebugMessages()
+
+            # selecting the event runs bindless feedback on the draw
             self.set_event(draw.nextAction.eventId, False)
 
             pipe = self.controller.GetVulkanPipelineState()
@@ -64,6 +74,24 @@ class VK_Descriptor_Heap(rdtest.TestCase):
                 heap_name = self.get_resource(heap.buffer).name
                 if heap_name != f"{'res' if name == 'resource' else 'samp'}Heap":
                     raise rdtest.TestFailureException(f"Unexpected {name} heap buffer name '{heap_name}'")
+
+            # feedback ran with a patched copy of the heap pipeline. There are no direct heap
+            # accesses reported yet, and the demo's set/binding mappings are not arrays, so no dynamic accesses
+            # are expected - but it must complete and not generate any validation errors
+            access = self.controller.GetDescriptorAccess()
+
+            for a in access:
+                if a.index != rd.DescriptorAccess.NoShaderBinding and a.arrayElement != 0:
+                    raise rdtest.TestFailureException(
+                        f"Unexpected dynamic descriptor access {a.stage} {a.type} {a.index}[{a.arrayElement}]")
+
+            msgs = [m for m in self.controller.GetDebugMessages()
+                    if m.severity in (rd.MessageSeverity.High, rd.MessageSeverity.Medium)]
+            if len(msgs) != 0:
+                raise rdtest.TestFailureException(
+                    f"Got validation messages after feedback: {[m.description for m in msgs]}")
+
+            rdtest.log.success(f"Heap Test {test} feedback ran with {len(access)} accesses")
 
             v = self.controller.GetPipelineState().GetViewport(0)
 

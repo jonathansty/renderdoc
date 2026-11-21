@@ -533,7 +533,8 @@ bool Processor::Parse()
     }
     else if(opcode == Op::Decorate || opcode == Op::MemberDecorate || opcode == Op::GroupDecorate ||
             opcode == Op::GroupMemberDecorate || opcode == Op::DecorationGroup ||
-            opcode == Op::DecorateString || opcode == Op::MemberDecorateString)
+            opcode == Op::DecorateString || opcode == Op::MemberDecorateString ||
+            opcode == Op::DecorateId || opcode == Op::MemberDecorateIdEXT)
     {
       START_SECTION(Section::Annotations);
     }

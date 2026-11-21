@@ -3445,6 +3445,14 @@ VulkanReplay::AddedDescriptorData VulkanReplay::PrepareExtraBufferDescriptor(
   const VulkanStatePipeline &srcPipeState = compute ? state.compute : state.graphics;
   const VulkanCreationInfo::Pipeline &pipe = c.m_Pipeline[srcPipeState.pipeline];
 
+  if(IsBinding(m_StorageMode) && state.UsesDescriptorHeaps(m_pDriver, compute))
+  {
+    // heap pipelines have no pipeline layout or descriptor sets we could add our own to, so they
+    // can only be patched with buffer addresses
+    RDCERR("Can't patch descriptor heap shaders without buffer device address");
+    return {};
+  }
+
   if(IsBinding(m_StorageMode))
   {
     // create a duplicate set of descriptor sets, all visible to compute, with bindings shifted to
