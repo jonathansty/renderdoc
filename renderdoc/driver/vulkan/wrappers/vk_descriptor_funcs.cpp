@@ -939,6 +939,14 @@ void WrappedVulkan::LookupDescriptor(byte *descriptorBytes, size_t descriptorSiz
 #endif
 }
 
+void WrappedVulkan::LookupHeapDescriptor(const byte *descriptorBytes, size_t descriptorSize,
+                                         DescriptorSetSlot &data)
+{
+  // heap descriptors have no estimated formats or GetDescriptorEXT equivalent we can use to
+  // validate, so only the exact bytes recorded when replaying the descriptor writes are used
+  data = m_DescriptorLookup.fallback.lookup({descriptorBytes, descriptorSize});
+}
+
 ResourceId WrappedVulkan::GetSamplerForDescriptor(byte *descriptorBytes, size_t descriptorSize)
 {
   if(m_DescriptorLookup.sampled == ImageDescriptorFormat::Indexed2012)
@@ -3926,7 +3934,41 @@ bool WrappedVulkan::Serialise_vkWriteSamplerDescriptorsEXT(SerialiserType &ser, 
       return false;
     }
 
-    // TODO(heap slice 2): RegisterDescriptor with a replay-created sampler
+    // there's no sampler object for a heap descriptor, so create a real one (de-duplicated) which
+    // is not listed as a resource but is registered in our creation info so it can be decoded
+    ResourceId samplerId;
+
+    uint64_t samplerHash = 0;
+    bool hashable = HashSamplerInfo(Sampler, samplerHash);
+
+    auto it = m_ReplayHeapSamplers.find(samplerHash);
+    if(hashable && it != m_ReplayHeapSamplers.end())
+    {
+      samplerId = it->second;
+    }
+    else
+    {
+      VkSampler sampler = VK_NULL_HANDLE;
+      vkr = vkCreateSampler(device, &Sampler, NULL, &sampler);
+      if(vkr != VK_SUCCESS)
+      {
+        SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                         "Failed to create sampler for heap descriptor: %s", ToStr(vkr).c_str());
+        return false;
+      }
+
+      samplerId = GetResID(sampler);
+
+      if(hashable)
+        m_ReplayHeapSamplers[samplerHash] = samplerId;
+    }
+
+    DescriptorSetSlot descriptorData = {};
+    descriptorData.SetSampler(samplerId);
+
+    // heap descriptors are only decoded by the trie, they are not part of descriptor buffer
+    // lookups (which depend on estimated formats) so don't use RegisterDescriptor
+    m_DescriptorLookup.fallback.insert(replayDescriptor, descriptorData);
   }
 
   return true;
@@ -4101,7 +4143,100 @@ bool WrappedVulkan::Serialise_vkWriteResourceDescriptorsEXT(
       return false;
     }
 
-    // TODO(heap slice 2): RegisterDescriptor with replay-created views / buffers
+    DescriptorSetSlot descriptorData = {};
+    descriptorData.type = convert(ResourceInfo.type);
+
+    switch(ResourceInfo.type)
+    {
+      // note heap COMBINED_IMAGE_SAMPLER descriptors in the resource heap are image-only (the
+      // sampler comes from the sampler heap), so this is treated as a plain image slot with no sampler
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      {
+        if(ResourceInfo.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+          descriptorData.type = DescriptorSlotType::SampledImage;
+
+        const VkImageDescriptorInfoEXT *imageInfo = ResourceInfo.data.pImage;
+        if(imageInfo && imageInfo->pView && imageInfo->pView->image != VK_NULL_HANDLE)
+        {
+          // there's no view object for the descriptor, so create a real one (de-duplicated) which
+          // is not listed as a resource but is registered in our creation info
+          ResourceId viewId;
+
+          uint64_t viewHash = 0;
+          bool hashable = HashImageViewInfo(*imageInfo->pView, viewHash);
+          std::pair<ResourceId, uint64_t> viewKey(GetResID(imageInfo->pView->image), viewHash);
+
+          auto it = m_ReplayHeapImageViews.find(viewKey);
+          if(hashable && it != m_ReplayHeapImageViews.end())
+          {
+            viewId = it->second;
+          }
+          else
+          {
+            VkImageView view = VK_NULL_HANDLE;
+            vkr = vkCreateImageView(device, imageInfo->pView, NULL, &view);
+            if(vkr != VK_SUCCESS)
+            {
+              SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                               "Failed to create image view for heap descriptor: %s",
+                               ToStr(vkr).c_str());
+              return false;
+            }
+
+            viewId = GetResID(view);
+
+            if(hashable)
+              m_ReplayHeapImageViews[viewKey] = viewId;
+          }
+
+          descriptorData.resource = viewId;
+        }
+
+        if(imageInfo)
+          descriptorData.imageLayoutOrFormat = convert(imageInfo->layout);
+        break;
+      }
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      {
+        const VkTexelBufferDescriptorInfoEXT *texelInfo = ResourceInfo.data.pTexelBuffer;
+        if(texelInfo && texelInfo->addressRange.address)
+        {
+          GetResIDFromAddr(texelInfo->addressRange.address, descriptorData.resource,
+                           descriptorData.offset);
+          descriptorData.range = texelInfo->addressRange.size;
+          descriptorData.imageLayoutOrFormat = DescriptorSlotImageLayout(texelInfo->format & 0xff);
+          RDCASSERT(uint32_t(texelInfo->format) < 0xff, texelInfo->format);
+        }
+        break;
+      }
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      {
+        const VkDeviceAddressRangeEXT *addrRange = ResourceInfo.data.pAddressRange;
+        if(addrRange && addrRange->address)
+        {
+          GetResIDFromAddr(addrRange->address, descriptorData.resource, descriptorData.offset);
+          descriptorData.range = addrRange->size;
+        }
+        break;
+      }
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+      {
+        const VkDeviceAddressRangeEXT *addrRange = ResourceInfo.data.pAddressRange;
+        if(addrRange && addrRange->address)
+          descriptorData.resource = GetASFromAddr(addrRange->address);
+        break;
+      }
+      default: RDCERR("Unexpected heap descriptor type %s", ToStr(ResourceInfo.type).c_str()); break;
+    }
+
+    // heap descriptors are only decoded by the trie, they are not part of descriptor buffer
+    // lookups (which depend on estimated formats) so don't use RegisterDescriptor
+    m_DescriptorLookup.fallback.insert(replayDescriptor, descriptorData);
   }
 
   return true;

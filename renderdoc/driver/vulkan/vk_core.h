@@ -512,6 +512,17 @@ private:
   rdcarray<VkDescriptorType> m_NULLHeapDescriptorPatternsSaved;
   std::unordered_set<uint64_t> m_HeapSamplerHashes;
   uint32_t HeapDescriptorSize(VkDescriptorType type);
+
+  // replay only: heap descriptors have no view/sampler objects of their own, so we create real
+  // (internal, not listed as resources) ones for each unique create info so that descriptors can be
+  // decoded. Image views are keyed on the image and a hash of the rest of the create info
+  std::map<std::pair<ResourceId, uint64_t>, ResourceId> m_ReplayHeapImageViews;
+  std::map<uint64_t, ResourceId> m_ReplayHeapSamplers;
+
+  // decodes a descriptor read from a descriptor heap, only using the descriptors registered when
+  // replaying vkWrite*DescriptorsEXT
+  void LookupHeapDescriptor(const byte *descriptorBytes, size_t descriptorSize,
+                            DescriptorSetSlot &data);
   uint32_t m_ResourceDescriptorBufferReserveSize = 0;
   rdcarray<ResourceId> m_ResourceDescBuffers;
   std::unordered_map<ResourceId, ResourceId> m_InlineBuffers;

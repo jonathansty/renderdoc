@@ -2751,11 +2751,16 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
   }
 
   // check for a descriptor buffer
+  // (or a descriptor heap, which is decoded the same way but with different descriptor sizes)
   if(WrappedVkBuffer::IsAlloc(rm->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)) != 0)
+       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT)) != 0)
   {
+    const bool heap = (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
+                       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT) != 0;
+
     // we assume batched queries, so get the whole descriptor buffer at once
     bytebuf data;
     GetBufferData(descriptorStore, 0, 0, data);
@@ -2779,10 +2784,15 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
         }
         else
         {
-          uint32_t size = m_pDriver->DescriptorDataSize(MakeVkDescriptorType(r.type, false));
+          VkDescriptorType vkType = MakeVkDescriptorType(r.type, false);
+          uint32_t size = heap ? m_pDriver->HeapDescriptorSize(vkType)
+                               : m_pDriver->DescriptorDataSize(vkType);
           // should not be larger, only smaller with mutable descriptors
           RDCASSERT(size <= r.descriptorSize);
-          m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
+          if(heap)
+            m_pDriver->LookupHeapDescriptor(descriptor, size, tmp);
+          else
+            m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
 
           FillDescriptor(ret[dst], tmp);
         }
@@ -2896,11 +2906,16 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
   }
 
   // check for a descriptor buffer
+  // (or a descriptor heap, which is decoded the same way but with different descriptor sizes)
   if(WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
-       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)) != 0)
+       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT)) != 0)
   {
+    const bool heap = (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
+                       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT) != 0;
+
     // we assume batched queries, so get the whole descriptor buffer at once
     bytebuf data;
     GetBufferData(descriptorStore, 0, 0, data);
@@ -2914,7 +2929,8 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
 
       for(uint32_t i = 0; i < r.count; i++)
       {
-        if(r.type != DescriptorType::Sampler && r.type != DescriptorType::ImageSampler)
+        // heap combined image/sampler descriptors are image-only, the sampler is in the sampler heap
+        if(r.type != DescriptorType::Sampler && (heap || r.type != DescriptorType::ImageSampler))
         {
           ret[dst].type = r.type;
         }
@@ -2924,10 +2940,15 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
         }
         else
         {
-          uint32_t size = m_pDriver->DescriptorDataSize(MakeVkDescriptorType(r.type, false));
+          VkDescriptorType vkType = MakeVkDescriptorType(r.type, false);
+          uint32_t size = heap ? m_pDriver->HeapDescriptorSize(vkType)
+                               : m_pDriver->DescriptorDataSize(vkType);
           // should not be larger, only smaller with mutable descriptors
           RDCASSERT(size <= r.descriptorSize);
-          m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
+          if(heap)
+            m_pDriver->LookupHeapDescriptor(descriptor, size, tmp);
+          else
+            m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
 
           FillSamplerDescriptor(ret[dst], tmp);
         }
@@ -3178,6 +3199,34 @@ rdcarray<DescriptorLogicalLocation> VulkanReplay::GetDescriptorLocations(
       d.category = DescriptorCategory::ConstantBlock;
       d.fixedBindNumber = ~0U - 1;
       d.logicalBindName = "Push constants";
+    }
+
+    return ret;
+  }
+
+  // descriptor heaps are named by index. There's no fixed element size in a heap (shaders index it
+  // with a stride of the size of the type being accessed) so we use the stride the caller gave us
+  if(WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
+     (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
+      VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT) != 0)
+  {
+    size_t dst = 0;
+    for(const DescriptorRange &r : ranges)
+    {
+      const uint32_t stride = RDCMAX(1U, r.descriptorSize);
+
+      uint32_t byteOffset = r.offset;
+
+      for(uint32_t i = 0; i < r.count; i++, dst++, byteOffset += stride)
+      {
+        DescriptorLogicalLocation &l = ret[dst];
+
+        l.category = CategoryForDescriptorType(r.type);
+        l.fixedBindNumber = byteOffset;
+        l.logicalBindName = StringFormat::Fmt(
+            "%s[%u]", r.type == DescriptorType::Sampler ? "SamplerHeap" : "ResourceHeap",
+            byteOffset / stride);
+      }
     }
 
     return ret;

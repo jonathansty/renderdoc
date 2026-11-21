@@ -511,6 +511,16 @@ void main()
       vkCmdBindResourceHeapEXT(cmd, &resBind);
       vkCmdBindSamplerHeapEXT(cmd, &sampBind);
 
+      // report the layout of the heaps so that the test can look up the descriptors we wrote
+      setMarker(cmd, "Heap Layout: imgStride=" + std::to_string(imgStride) +
+                         " bufStride=" + std::to_string(bufStride) +
+                         " sampStride=" + std::to_string(sampStride) +
+                         " tex=" + std::to_string(texOffset) + " ubo=" + std::to_string(uboOffset) +
+                         " ssbo=" + std::to_string(ssboOffset) +
+                         " texArray=" + std::to_string(texArrayOffset) +
+                         " samp=" + std::to_string(sampOffset) +
+                         " customSamp=" + std::to_string(customSampOffset));
+
       vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
 
       const float cellW = float(screenWidth) / 4.0f;
