@@ -1,3 +1,4 @@
+import struct
 import renderdoc as rd
 import rdtest
 
@@ -42,6 +43,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
         ]
 
         self.check_heap_descriptors()
+
+        self.check_direct_heap_access()
 
         eid = 0
 
@@ -217,3 +220,143 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             raise rdtest.TestFailureException(f"Unexpected sampler heap location name {locs[0].logicalBindName}")
 
         rdtest.log.success("Heap descriptors decoded as expected")
+
+    def check_no_validation(self, what):
+        msgs = [m for m in self.controller.GetDebugMessages()
+                if m.severity in (rd.MessageSeverity.High, rd.MessageSeverity.Medium)]
+        if len(msgs) != 0:
+            raise rdtest.TestFailureException(
+                f"Got validation messages after {what}: {[m.description for m in msgs]}")
+
+    def check_direct_accesses(self, name, expected):
+        """Check the direct heap accesses at the current event are exactly the expected set of
+        (stage, type, heap, byte offset, resource name) tuples, and that their contents decode."""
+        pipe = self.controller.GetVulkanPipelineState()
+        res_heap = pipe.resourceHeap.buffer
+        samp_heap = pipe.samplerHeap.buffer
+
+        access = [a for a in self.controller.GetDescriptorAccess()
+                  if a.index == rd.DescriptorAccess.NoShaderBinding]
+
+        got = []
+        for a in access:
+            if a.descriptorStore == res_heap:
+                heap = 'res'
+            elif a.descriptorStore == samp_heap:
+                heap = 'samp'
+            else:
+                raise rdtest.TestFailureException(
+                    f"{name}: direct heap access {a.stage} {a.type} @ {a.byteOffset} has unexpected store "
+                    f"{a.descriptorStore}")
+
+            if a.type == rd.DescriptorType.Sampler:
+                samp = self.controller.GetSamplerDescriptors(a.descriptorStore, [rd.DescriptorRange(a)])[0]
+                if samp.filter.minify != rd.FilterMode.Point or samp.addressU != rd.AddressMode.ClampEdge:
+                    raise rdtest.TestFailureException(f"{name}: sampler access decoded unexpectedly")
+                res = None
+            else:
+                desc = self.controller.GetDescriptors(a.descriptorStore, [rd.DescriptorRange(a)])[0]
+                if desc.type != a.type:
+                    raise rdtest.TestFailureException(
+                        f"{name}: descriptor at {a.byteOffset} is {desc.type}, access is {a.type}")
+                res = self.get_resource(desc.resource).name if desc.resource != rd.ResourceId() else None
+
+            got.append((a.stage, a.type, heap, a.byteOffset, res))
+
+        if sorted(got, key=str) != sorted(expected, key=str):
+            raise rdtest.TestFailureException(
+                f"{name}: direct heap accesses don't match. Got: {sorted(got, key=str)} Expected: "
+                f"{sorted(expected, key=str)}")
+
+        rdtest.log.success(f"{name} reported the expected {len(got)} direct heap accesses")
+
+        return access
+
+    def check_direct_heap_access(self):
+        layout_action = self.find_action("Direct Heap Indices:")
+
+        if layout_action is None:
+            raise rdtest.TestFailureException("Couldn't find the direct heap indices marker")
+
+        layout = {}
+        for item in layout_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        img = layout['imgSize']
+        buf = layout['bufSize']
+        samp = layout['sampSize']
+
+        Image = rd.DescriptorType.Image
+        RWImage = rd.DescriptorType.ReadWriteImage
+        RWBuffer = rd.DescriptorType.ReadWriteBuffer
+        Sampler = rd.DescriptorType.Sampler
+
+        # compute dispatch
+        rdtest.log.begin_section("Direct Heap Dispatch")
+
+        dispatch = self.find_action("Direct Heap Dispatch").nextAction
+        if not (dispatch.flags & rd.ActionFlags.Dispatch):
+            raise rdtest.TestFailureException(f"Expected a dispatch after the marker, got {dispatch.customName}")
+
+        self.controller.GetDebugMessages()
+        self.set_event(dispatch.eventId, False)
+
+        cs = rd.ShaderStage.Compute
+        access = self.check_direct_accesses("Dispatch", [
+            (cs, Image, 'res', layout['tex'] * img, "directTex"),
+            (cs, RWImage, 'res', layout['outTex'] * img, "directOutTex"),
+            (cs, RWBuffer, 'res', layout['buf'] * buf, "directBuf"),
+            (cs, RWBuffer, 'res', layout['outBuf'] * buf, "directOutBuf"),
+            (cs, Sampler, 'samp', layout['samp'] * samp, None),
+        ])
+
+        for a in access:
+            expected_size = samp if a.type == Sampler else (buf if a.type == RWBuffer else img)
+            if a.byteSize != expected_size:
+                raise rdtest.TestFailureException(
+                    f"Direct heap access {a.type} has byteSize {a.byteSize}, expected {expected_size}")
+
+        self.check_no_validation("direct heap dispatch feedback")
+
+        # the dispatch output is texture + buffer colour
+        out_buf = [r for r in self.controller.GetResources() if r.name == "directOutBuf"][0].resourceId
+        data = struct.unpack_from("4f", self.controller.GetBufferData(out_buf, 0, 16), 0)
+        if not rdtest.value_compare(list(data), [2.0, 1.5, 1.0, 2.0], eps=0.02):
+            raise rdtest.TestFailureException(f"Direct heap dispatch output is {list(data)}")
+
+        rdtest.log.success("Direct heap dispatch output is as expected")
+
+        rdtest.log.end_section("Direct Heap Dispatch")
+
+        # draw, with the buffer accessed from both stages
+        rdtest.log.begin_section("Direct Heap Draw")
+
+        draw = self.find_action("Direct Heap Draw").nextAction
+
+        self.controller.GetDebugMessages()
+        self.set_event(draw.eventId, False)
+
+        vs = rd.ShaderStage.Vertex
+        ps = rd.ShaderStage.Pixel
+        self.check_direct_accesses("Draw", [
+            (vs, RWBuffer, 'res', layout['buf'] * buf, "directBuf"),
+            (ps, RWBuffer, 'res', layout['buf'] * buf, "directBuf"),
+            (ps, Image, 'res', layout['tex'] * img, "directTex"),
+            (ps, Sampler, 'samp', layout['samp'] * samp, None),
+        ])
+
+        self.check_no_validation("direct heap draw feedback")
+
+        v = self.controller.GetPipelineState().GetViewport(0)
+        out = self.controller.GetPipelineState().GetOutputTargets()[0].resource
+
+        # the quad is scaled to the middle half of the viewport, coloured by the texture * buffer colour
+        self.check_pixel_value(out, int(v.x + v.width * 0.5), int(v.y + v.height * 0.5), [1.0, 0.5, 0.0, 1.0],
+                               eps=0.02)
+        self.check_pixel_value(out, int(v.x + v.width * 0.1), int(v.y + v.height * 0.1), [0.2, 0.2, 0.2, 1.0],
+                               eps=0.02)
+
+        rdtest.log.success("Direct heap draw output is as expected")
+
+        rdtest.log.end_section("Direct Heap Draw")

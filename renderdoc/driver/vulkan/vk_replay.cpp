@@ -3155,7 +3155,34 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
   const VKDynamicShaderFeedback &usage = m_BindlessFeedback[eventId];
 
   if(usage.valid)
+  {
+    size_t first = ret.size();
     ret.append(usage.access);
+
+    // direct descriptor heap accesses are relative to the bound heap, resolve them to the heap
+    // buffer. The heap is implied by the type, samplers can only be in the sampler heap
+    for(size_t i = first; i < ret.size(); i++)
+    {
+      DescriptorAccess &access = ret[i];
+
+      if(access.index != DescriptorAccess::NoShaderBinding)
+        continue;
+
+      const VulkanRenderState::DescriptorHeapBind &heap =
+          access.type == DescriptorType::Sampler ? state.samplerHeap : state.resourceHeap;
+
+      access.descriptorStore = ResourceId();
+
+      if(heap.valid)
+      {
+        ResourceId id;
+        uint64_t offs = 0;
+        m_pDriver->GetResIDFromAddr(heap.address, id, offs);
+        access.descriptorStore = id;
+        access.byteOffset += uint32_t(offs);
+      }
+    }
+  }
 
   // remove any invalid accesses
   ret.removeIf([](const DescriptorAccess &access) { return access.descriptorStore == ResourceId(); });

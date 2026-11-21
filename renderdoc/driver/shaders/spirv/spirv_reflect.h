@@ -97,6 +97,9 @@ struct SPIRVPatchData
   bool invalidTaskPayload = false;
 
   bool usesPrintf = false;
+
+  // if the shader accesses the descriptor heaps directly (SPV_EXT_descriptor_heap)
+  bool usesDescriptorHeap = false;
 };
 
 namespace rdcspv

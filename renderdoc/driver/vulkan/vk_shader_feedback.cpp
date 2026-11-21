@@ -69,9 +69,40 @@ struct BindData
   DescriptorAccess access;
 };
 
+// direct descriptor heap access (SPV_EXT_descriptor_heap) writes a value with this magic in the
+// upper 16 bits, the mask of stages that accessed it in the next 8 bits, and the descriptor type
+// in the lower 8 bits. This mirrors D3D12's direct heap access feedback
+static const uint32_t HeapFeedbackMagic = 0xfeed0000U;
+static const uint32_t HeapFeedbackMagicMask = 0xffff0000U;
+static const uint32_t HeapFeedbackTypeMask = 0x000000ffU;
+static const uint32_t HeapFeedbackStageMask = 0x0000ff00U;
+static const uint32_t HeapFeedbackStageShift = 8;
+
+// cap on the number of slots per heap, larger heaps are clamped (accesses beyond are attributed to
+// the last slot)
+static const uint32_t MaxHeapFeedbackSlots = 1U << 20;
+
+enum HeapFeedbackIndex
+{
+  HeapFeedbackResource = 0,
+  HeapFeedbackSampler = 1,
+  HeapFeedbackCount,
+};
+
+struct HeapFeedbackRegion
+{
+  // byte offset of this heap's slots in the feedback buffer
+  uint64_t offset = 0;
+  // the number of uint32 slots in the region. Zero if the heap is not instrumented
+  uint32_t numSlots = 0;
+  // each slot covers (1 << slotShift) bytes in the heap
+  uint32_t slotShift = 0;
+};
+
 struct BindlessFeedbackData
 {
   std::map<BindKey, BindData> offsetMap;
+  HeapFeedbackRegion heaps[HeapFeedbackCount];
   uint32_t feedbackStorageSize = 0;
 };
 
@@ -346,9 +377,9 @@ rdcspv::Id MakeOffsettedPointer<uint32_t>(rdcspv::Editor &editor, rdcspv::Iter &
 template <typename uintvulkanmax_t>
 void AnnotateShader(const ShaderReflection &refl, const SPIRVPatchData &patchData, ShaderStage stage,
                     const char *entryName, const std::map<BindKey, BindData> &offsetMap,
-                    uint32_t maxSlot, bool usePrimitiveID, VkDeviceAddress addr,
-                    BufferStorageMode storageMode, bool usesMultiview, rdcarray<uint32_t> &modSpirv,
-                    std::map<uint32_t, PrintfData> &printfData)
+                    const HeapFeedbackRegion *heapRegions, uint32_t maxSlot, bool usePrimitiveID,
+                    VkDeviceAddress addr, BufferStorageMode storageMode, bool usesMultiview,
+                    rdcarray<uint32_t> &modSpirv, std::map<uint32_t, PrintfData> &printfData)
 {
   // calculate offsets for IDs on the original unmodified SPIR-V. The editor may insert some nops,
   // so we do it manually here
@@ -356,6 +387,131 @@ void AnnotateShader(const ShaderReflection &refl, const SPIRVPatchData &patchDat
 
   for(rdcspv::Iter it(modSpirv, rdcspv::FirstRealWord); it; it++)
     idToOffset[rdcspv::OpDecoder(it).result] = (uint32_t)it.offs();
+
+  // gather the information needed to instrument direct descriptor heap accesses. This is done on
+  // the unmodified SPIR-V for the same reason as above, the declarations section is all we need.
+  //
+  // Heap accesses are untyped access chains based on a variable decorated with the ResourceHeapEXT
+  // or SamplerHeapEXT builtin. The base type is an array of descriptor types (or structs of them)
+  // with an ArrayStrideIdEXT decoration giving the stride - usually an OpConstantSizeOfEXT of the
+  // descriptor type - so we can calculate the byte offset in the heap in the shader using the same
+  // constants without needing to know the descriptor sizes.
+  struct HeapArrayType
+  {
+    rdcspv::Id elemType;
+    rdcspv::Id strideId;
+    uint32_t stride = 0;
+  };
+
+  struct HeapMemberOffset
+  {
+    rdcspv::Id offsetId;
+    uint32_t offset = ~0U;
+  };
+
+  std::map<rdcspv::Id, HeapFeedbackIndex> heapVars;
+  std::map<rdcspv::Id, HeapArrayType> heapArrayTypes;
+  std::map<rdcspv::Id, rdcarray<rdcspv::Id>> heapStructTypes;
+  std::map<rdcpair<rdcspv::Id, uint32_t>, HeapMemberOffset> heapMemberOffsets;
+  std::map<rdcspv::Id, DescriptorType> heapDescriptorTypes;
+  std::map<rdcspv::Id, uint32_t> heapIntConstants;
+
+  const bool instrumentHeaps = IsBDA(storageMode) && heapRegions &&
+                               (heapRegions[HeapFeedbackResource].numSlots > 0 ||
+                                heapRegions[HeapFeedbackSampler].numSlots > 0);
+
+  if(instrumentHeaps)
+  {
+    for(rdcspv::Iter it(modSpirv, rdcspv::FirstRealWord); it; it++)
+    {
+      const rdcspv::Op opcode = it.opcode();
+
+      if(opcode == rdcspv::Op::Function)
+        break;
+
+      if(opcode == rdcspv::Op::Decorate || opcode == rdcspv::Op::DecorateId)
+      {
+        rdcspv::OpDecorate dec(it);
+
+        if(dec.decoration == rdcspv::Decoration::BuiltIn)
+        {
+          if(dec.decoration.builtIn == rdcspv::BuiltIn::ResourceHeapEXT)
+            heapVars[dec.target] = HeapFeedbackResource;
+          else if(dec.decoration.builtIn == rdcspv::BuiltIn::SamplerHeapEXT)
+            heapVars[dec.target] = HeapFeedbackSampler;
+        }
+        else if(dec.decoration == rdcspv::Decoration::ArrayStride)
+        {
+          heapArrayTypes[dec.target].stride = dec.decoration.arrayStride;
+        }
+        else if(dec.decoration == rdcspv::Decoration::ArrayStrideIdEXT)
+        {
+          heapArrayTypes[dec.target].strideId = dec.decoration.arrayStrideIdEXT;
+        }
+      }
+      else if(opcode == rdcspv::Op::MemberDecorate || opcode == rdcspv::Op::MemberDecorateIdEXT)
+      {
+        rdcspv::OpMemberDecorate dec(it);
+
+        if(dec.decoration == rdcspv::Decoration::Offset)
+          heapMemberOffsets[{dec.structureType, dec.member}].offset = dec.decoration.offset;
+        else if(dec.decoration == rdcspv::Decoration::OffsetIdEXT)
+          heapMemberOffsets[{dec.structureType, dec.member}].offsetId = dec.decoration.offsetIdEXT;
+      }
+      else if(opcode == rdcspv::Op::TypeRuntimeArray)
+      {
+        rdcspv::OpTypeRuntimeArray arr(it);
+        heapArrayTypes[arr.result].elemType = arr.elementType;
+      }
+      else if(opcode == rdcspv::Op::TypeArray)
+      {
+        rdcspv::OpTypeArray arr(it);
+        heapArrayTypes[arr.result].elemType = arr.elementType;
+      }
+      else if(opcode == rdcspv::Op::TypeStruct)
+      {
+        rdcspv::OpTypeStruct str(it);
+        heapStructTypes[str.result] = str.members;
+      }
+      else if(opcode == rdcspv::Op::TypeImage)
+      {
+        rdcspv::OpTypeImage img(it);
+        const bool texelBuffer = img.dim == rdcspv::Dim::Buffer;
+        if(img.sampled == 2)
+          heapDescriptorTypes[img.result] =
+              texelBuffer ? DescriptorType::ReadWriteTypedBuffer : DescriptorType::ReadWriteImage;
+        else
+          heapDescriptorTypes[img.result] =
+              texelBuffer ? DescriptorType::TypedBuffer : DescriptorType::Image;
+      }
+      else if(opcode == rdcspv::Op::TypeSampler)
+      {
+        heapDescriptorTypes[rdcspv::OpTypeSampler(it).result] = DescriptorType::Sampler;
+      }
+      else if(opcode == rdcspv::Op::TypeSampledImage)
+      {
+        heapDescriptorTypes[rdcspv::OpTypeSampledImage(it).result] = DescriptorType::ImageSampler;
+      }
+      else if(opcode == rdcspv::Op::TypeAccelerationStructureKHR)
+      {
+        heapDescriptorTypes[rdcspv::OpTypeAccelerationStructureKHR(it).result] =
+            DescriptorType::AccelerationStructure;
+      }
+      else if(opcode == rdcspv::Op::TypeBufferEXT)
+      {
+        rdcspv::OpTypeBufferEXT buf(it);
+        heapDescriptorTypes[buf.result] = buf.storageClass == rdcspv::StorageClass::Uniform
+                                              ? DescriptorType::ConstantBuffer
+                                              : DescriptorType::ReadWriteBuffer;
+      }
+      else if(opcode == rdcspv::Op::Constant)
+      {
+        // only need 32-bit integer constants, for struct member indices
+        if(it.size() == 4)
+          heapIntConstants[rdcspv::Id::fromWord(it.word(2))] = it.word(3);
+      }
+    }
+  }
 
   rdcspv::Editor editor(modSpirv);
 
@@ -547,6 +703,59 @@ void AnnotateShader(const ShaderReflection &refl, const SPIRVPatchData &patchDat
   for(auto scalarType : editor.GetTypeInfo<rdcspv::Scalar>())
     if(scalarType.first.type == rdcspv::Op::TypeInt)
       intTypeLookup[scalarType.second] = scalarType.first;
+
+  // pointers into a descriptor heap that we track - the heap variables themselves, and any untyped
+  // access chains based on them. The offset is the byte offset into the heap, as an
+  // indexOffsetType value (or no ID for 0)
+  struct HeapPointer
+  {
+    HeapFeedbackIndex heap;
+    rdcspv::Id byteOffset;
+  };
+  std::map<rdcspv::Id, HeapPointer> heapPtrs;
+
+  // per-heap constants for instrumenting
+  rdcspv::Id heapZero;
+  rdcspv::Id heapSlotShift[HeapFeedbackCount];
+  rdcspv::Id heapMaxSlot[HeapFeedbackCount];
+  rdcspv::Id heapRegionOffset[HeapFeedbackCount];
+  std::map<DescriptorType, rdcspv::Id> heapFeedbackValue;
+
+  if(instrumentHeaps)
+  {
+    for(auto it = heapVars.begin(); it != heapVars.end(); ++it)
+      heapPtrs[it->first] = {it->second, rdcspv::Id()};
+
+    heapZero = editor.AddConstantImmediate<uintvulkanmax_t>(0);
+
+    for(uint32_t h = 0; h < HeapFeedbackCount; h++)
+    {
+      if(heapRegions[h].numSlots == 0)
+        continue;
+
+      heapSlotShift[h] = editor.AddConstantImmediate<uint32_t>(heapRegions[h].slotShift);
+      heapMaxSlot[h] =
+          editor.AddConstantImmediate<uintvulkanmax_t>(uintvulkanmax_t(heapRegions[h].numSlots - 1));
+      heapRegionOffset[h] =
+          editor.AddConstantImmediate<uintvulkanmax_t>(uintvulkanmax_t(heapRegions[h].offset));
+
+      editor.SetName(heapRegionOffset[h], h == HeapFeedbackSampler
+                                              ? "__feedbackOffset_SamplerHeap"
+                                              : "__feedbackOffset_ResourceHeap");
+    }
+
+    const uint32_t stageBits =
+        (uint32_t(MaskForStage(stage)) << HeapFeedbackStageShift) & HeapFeedbackStageMask;
+
+    for(auto it = heapDescriptorTypes.begin(); it != heapDescriptorTypes.end(); ++it)
+    {
+      if(heapFeedbackValue.find(it->second) == heapFeedbackValue.end())
+        heapFeedbackValue[it->second] = editor.AddConstantImmediate<uint32_t>(
+            HeapFeedbackMagic | stageBits | (uint32_t(it->second) & HeapFeedbackTypeMask));
+    }
+  }
+
+  bool heapWarned = false;
 
   rdcspv::Id entryID;
   for(const rdcspv::EntryPoint &entry : editor.GetEntries())
@@ -1003,6 +1212,188 @@ void AnnotateShader(const ShaderReflection &refl, const SPIRVPatchData &patchDat
         if(varIt != varLookup.end())
         {
           varLookup[copy.result] = varIt->second;
+        }
+
+        auto heapIt = heapPtrs.find(copy.operand);
+        if(heapIt != heapPtrs.end())
+        {
+          HeapPointer ptr = heapIt->second;
+          heapPtrs[copy.result] = ptr;
+        }
+      }
+
+      // direct descriptor heap accesses
+      if(instrumentHeaps && (it.opcode() == rdcspv::Op::UntypedAccessChainKHR ||
+                             it.opcode() == rdcspv::Op::UntypedInBoundsAccessChainKHR))
+      {
+        // both opcodes have identical encodings
+        rdcspv::OpUntypedAccessChainKHR chain(it);
+
+        auto heapIt = heapPtrs.find(chain.base);
+        if(heapIt != heapPtrs.end())
+        {
+          HeapPointer ptr = heapIt->second;
+
+          // we insert after the access chain. Track the last instruction we added so that the loop
+          // continues from after it, whether or not we end up writing any feedback
+          rdcspv::Iter last = it;
+          it++;
+
+          auto emit = [&editor, &it, &last](const rdcspv::Operation &op) {
+            rdcspv::Id ret = editor.AddOperation(it, op);
+            last = it;
+            it++;
+            return ret;
+          };
+
+          // convert an integer to our unsigned target width
+          auto toTarget = [&](rdcspv::Id val) {
+            rdcspv::Id valType = editor.GetIDType(val);
+
+            rdcspv::Scalar valTypeData = rdcspv::scalar<uint32_t>();
+            auto valTypeIt = intTypeLookup.find(valType);
+
+            if(valTypeIt != intTypeLookup.end())
+              valTypeData = valTypeIt->second;
+            else
+              RDCERR("Unknown index type ID %u, defaulting to uint32_t", valType.value());
+
+            if(valTypeData.signedness)
+            {
+              valTypeData.signedness = false;
+              val = emit(rdcspv::OpBitcast(editor.DeclareType(valTypeData), editor.MakeId(), val));
+            }
+
+            if(valTypeData.width != targetIndexWidth)
+              val = emit(rdcspv::OpUConvert(indexOffsetType, editor.MakeId(), val));
+
+            return val;
+          };
+
+          // walk the indices accumulating the byte offset
+          rdcspv::Id curType = chain.baseType;
+          bool valid = true;
+
+          for(rdcspv::Id idx : chain.indexes)
+          {
+            rdcspv::Id term;
+
+            auto arrIt = heapArrayTypes.find(curType);
+            auto strIt = heapStructTypes.find(curType);
+
+            if(arrIt != heapArrayTypes.end() && arrIt->second.elemType != rdcspv::Id())
+            {
+              rdcspv::Id stride;
+              if(arrIt->second.strideId != rdcspv::Id())
+                stride = toTarget(arrIt->second.strideId);
+              else if(arrIt->second.stride != 0)
+                stride = editor.AddConstantDeferred<uintvulkanmax_t>(
+                    uintvulkanmax_t(arrIt->second.stride));
+
+              if(stride == rdcspv::Id())
+              {
+                valid = false;
+                break;
+              }
+
+              rdcspv::Id index = toTarget(idx);
+              term = emit(rdcspv::OpIMul(indexOffsetType, editor.MakeId(), index, stride));
+
+              curType = arrIt->second.elemType;
+            }
+            else if(strIt != heapStructTypes.end())
+            {
+              auto constIt = heapIntConstants.find(idx);
+              if(constIt == heapIntConstants.end() || constIt->second >= strIt->second.size())
+              {
+                valid = false;
+                break;
+              }
+
+              auto offsIt = heapMemberOffsets.find({curType, constIt->second});
+              if(offsIt == heapMemberOffsets.end())
+              {
+                valid = false;
+                break;
+              }
+
+              if(offsIt->second.offsetId != rdcspv::Id())
+                term = toTarget(offsIt->second.offsetId);
+              else if(offsIt->second.offset != ~0U)
+                term = editor.AddConstantDeferred<uintvulkanmax_t>(
+                    uintvulkanmax_t(offsIt->second.offset));
+
+              if(term == rdcspv::Id())
+              {
+                valid = false;
+                break;
+              }
+
+              curType = strIt->second[constIt->second];
+            }
+            else
+            {
+              valid = false;
+              break;
+            }
+
+            if(ptr.byteOffset == rdcspv::Id())
+              ptr.byteOffset = term;
+            else
+              ptr.byteOffset =
+                  emit(rdcspv::OpIAdd(indexOffsetType, editor.MakeId(), ptr.byteOffset, term));
+          }
+
+          if(!valid)
+          {
+            if(!heapWarned)
+              RDCWARN("Unsupported descriptor heap access chain %u in %s shader, not instrumented",
+                      chain.result.value(), ToStr(stage).c_str());
+            heapWarned = true;
+          }
+          else
+          {
+            // track this pointer in case it's further indexed
+            heapPtrs[chain.result] = ptr;
+
+            auto typeIt = heapDescriptorTypes.find(curType);
+            const HeapFeedbackIndex h = ptr.heap;
+
+            // if this is a descriptor, write the feedback for it
+            if(typeIt != heapDescriptorTypes.end() && heapRegions[h].numSlots > 0)
+            {
+              rdcspv::Id byteOffset = ptr.byteOffset == rdcspv::Id() ? heapZero : ptr.byteOffset;
+
+              // slot = byteOffset >> slotShift
+              rdcspv::Id slot = emit(rdcspv::OpShiftRightLogical(indexOffsetType, editor.MakeId(),
+                                                                 byteOffset, heapSlotShift[h]));
+
+              // clamp the slot to the heap region so out of bounds accesses don't write out of
+              // bounds
+              slot = emit(rdcspv::OpGLSL450(indexOffsetType, editor.MakeId(), glsl450,
+                                            rdcspv::GLSLstd450::UMin, {slot, heapMaxSlot[h]}));
+
+              // feedbackOffset = regionOffset + (slot << 2)
+              rdcspv::Id feedbackOffset = emit(
+                  rdcspv::OpShiftLeftLogical(indexOffsetType, editor.MakeId(), slot, uint32shift));
+              feedbackOffset = emit(rdcspv::OpIAdd(indexOffsetType, editor.MakeId(), feedbackOffset,
+                                                   heapRegionOffset[h]));
+
+              rdcspv::Id bufptr = MakeOffsettedPointer<uintvulkanmax_t>(
+                  editor, it, uint32ptrtype, carryStructType, feedbackBuffer.second, feedbackOffset);
+              last = it;
+              it++;
+
+              // atomically OR in our value, so that each stage's bit accumulates
+              emit(rdcspv::OpAtomicOr(uint32Type, editor.MakeId(), bufptr, scope, semantics,
+                                      heapFeedbackValue[typeIt->second]));
+            }
+          }
+
+          // continue from the last instruction we added (or the access chain itself), the loop
+          // increment will move past it
+          it = last;
+          continue;
         }
       }
 
@@ -1758,6 +2149,62 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
     }
   }
 
+  // direct heap access: allocate a slot range for each bound heap if any stage indexes the heaps
+  // directly. Accesses from all stages share the range, each stage ORs in its own bit
+  if(usesHeaps)
+  {
+    bool directHeapAccess = false;
+    for(const VulkanCreationInfo::ShaderEntry *entry : shaderEntries)
+      if(entry && entry->patchData->usesDescriptorHeap)
+        directHeapAccess = true;
+
+    if(directHeapAccess)
+    {
+      const VkPhysicalDeviceDescriptorHeapPropertiesEXT &heapProps =
+          m_pDriver->m_DescriptorHeapProperties;
+
+      const VulkanRenderState::DescriptorHeapBind *binds[HeapFeedbackCount] = {
+          &state.resourceHeap,
+          &state.samplerHeap,
+      };
+
+      // the granularity of a slot is the smallest alignment of descriptors in each heap, so any
+      // valid descriptor offset maps to a unique slot
+      const VkDeviceSize alignments[HeapFeedbackCount] = {
+          RDCMIN(heapProps.imageDescriptorAlignment, heapProps.bufferDescriptorAlignment),
+          heapProps.samplerDescriptorAlignment,
+      };
+
+      for(uint32_t h = 0; h < HeapFeedbackCount; h++)
+      {
+        if(!binds[h]->valid || binds[h]->size == 0)
+          continue;
+
+        HeapFeedbackRegion &region = feedbackData.heaps[h];
+
+        region.slotShift = 0;
+        while((2ULL << region.slotShift) <= alignments[h])
+          region.slotShift++;
+
+        uint64_t numSlots = binds[h]->size >> region.slotShift;
+
+        if(numSlots > MaxHeapFeedbackSlots)
+        {
+          RDCWARN(
+              "%s heap is too large for feedback (%llu slots), accesses past %u slots will not be "
+              "distinguished",
+              h == HeapFeedbackSampler ? "Sampler" : "Resource", numSlots, MaxHeapFeedbackSlots);
+          numSlots = MaxHeapFeedbackSlots;
+        }
+
+        region.numSlots = (uint32_t)RDCMAX(1ULL, numSlots);
+        region.offset = feedbackData.feedbackStorageSize;
+
+        feedbackData.feedbackStorageSize += region.numSlots * sizeof(uint32_t);
+      }
+    }
+  }
+
   uint32_t maxSlot = uint32_t(feedbackData.feedbackStorageSize / sizeof(uint32_t));
 
   // add some extra padding just in case of out-of-bounds writes
@@ -1855,16 +2302,18 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
     if(m_pDriver->GetDeviceEnabledFeatures().shaderInt64)
     {
       AnnotateShader<uint64_t>(*shaderEntries[idx]->refl, *shaderEntries[idx]->patchData,
-                               ShaderStage(idx), entryName, feedbackData.offsetMap, maxSlot,
-                               usePrimitiveID, m_PatchedShaderFeedback.FeedbackBuffer.Address(),
-                               m_StorageMode, usesMultiview, modSpirv, printfData[idx]);
+                               ShaderStage(idx), entryName, feedbackData.offsetMap,
+                               feedbackData.heaps, maxSlot, usePrimitiveID,
+                               m_PatchedShaderFeedback.FeedbackBuffer.Address(), m_StorageMode,
+                               usesMultiview, modSpirv, printfData[idx]);
     }
     else
     {
       AnnotateShader<uint32_t>(*shaderEntries[idx]->refl, *shaderEntries[idx]->patchData,
-                               ShaderStage(idx), entryName, feedbackData.offsetMap, maxSlot,
-                               usePrimitiveID, m_PatchedShaderFeedback.FeedbackBuffer.Address(),
-                               m_StorageMode, usesMultiview, modSpirv, printfData[idx]);
+                               ShaderStage(idx), entryName, feedbackData.offsetMap,
+                               feedbackData.heaps, maxSlot, usePrimitiveID,
+                               m_PatchedShaderFeedback.FeedbackBuffer.Address(), m_StorageMode,
+                               usesMultiview, modSpirv, printfData[idx]);
     }
 
     if(!Vulkan_Debug_FeedbackDumpDirPath().empty())
@@ -1897,6 +2346,45 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
       }
 
       access.byteOffset += access.byteSize;
+    }
+  }
+
+  for(uint32_t h = 0; h < HeapFeedbackCount; h++)
+  {
+    const HeapFeedbackRegion &region = feedbackData.heaps[h];
+
+    if(region.numSlots == 0)
+      continue;
+
+    const uint32_t *readbackData = (const uint32_t *)(data.data() + region.offset);
+
+    for(uint32_t i = 0; i < region.numSlots; i++)
+    {
+      if((readbackData[i] & HeapFeedbackMagicMask) != HeapFeedbackMagic)
+        continue;
+
+      DescriptorAccess access;
+
+      // descriptorStore is set in GetDescriptorAccess from the heap bound at the time, implied by
+      // the type. The offset here is relative to the start of the bound heap range
+      access.index = DescriptorAccess::NoShaderBinding;
+      access.type = DescriptorType(readbackData[i] & HeapFeedbackTypeMask);
+      access.arrayElement = i;
+      access.byteOffset = i << region.slotShift;
+      access.byteSize = m_pDriver->HeapDescriptorSize(MakeVkDescriptorType(access.type, false));
+
+      ShaderStageMask feedbackStages =
+          ShaderStageMask((readbackData[i] & HeapFeedbackStageMask) >> HeapFeedbackStageShift);
+
+      // add an access for each stage that reported it
+      for(uint32_t s = 0; s < NumShaderStages; s++)
+      {
+        if(MaskForStage(ShaderStage(s)) & feedbackStages)
+        {
+          access.stage = ShaderStage(s);
+          result.access.push_back(access);
+        }
+      }
     }
   }
 

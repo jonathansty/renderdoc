@@ -1877,6 +1877,9 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
     if(it->second == "NonSemantic.DebugPrintf")
       patchData.usesPrintf = true;
 
+  patchData.usesDescriptorHeap =
+      capabilities.find(rdcspv::Capability::DescriptorHeapEXT) != capabilities.end();
+
   // sort system value semantics to the start of the list
   struct sig_param_sort
   {
