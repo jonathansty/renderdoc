@@ -209,6 +209,12 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             raise rdtest.TestFailureException(
                 f"Sampler 1 has unexpected border {samps[1].addressU} {list(border)}")
 
+        # heap samplers have no application object, the replay-created one must still be named
+        names = {r.resourceId: r.name for r in self.controller.GetResources()}
+        for i, s in enumerate(samps):
+            if not names.get(s.object, "").startswith("Heap Sampler "):
+                raise rdtest.TestFailureException(f"Sampler {i} object {s.object} has no heap sampler name")
+
         # names of the heap locations
         locs = self.controller.GetDescriptorLocations(res_heap, [ranges[3]])
         n = layout['texArray'] // img_stride

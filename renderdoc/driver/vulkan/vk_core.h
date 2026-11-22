@@ -518,6 +518,10 @@ private:
   // decoded. Image views are keyed on the image and a hash of the rest of the create info
   std::map<std::pair<ResourceId, uint64_t>, ResourceId> m_ReplayHeapImageViews;
   std::map<uint64_t, ResourceId> m_ReplayHeapSamplers;
+  // counters to give the replay-created heap objects stable readable names
+  uint32_t m_ReplayHeapImageViewCount = 0;
+  uint32_t m_ReplayHeapSamplerCount = 0;
+  void NameReplayHeapObject(ResourceId id, ResourceType type, const rdcstr &name);
 
   // decodes a descriptor read from a descriptor heap, only using the descriptors registered when
   // replaying vkWrite*DescriptorsEXT
