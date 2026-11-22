@@ -46,6 +46,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_direct_heap_access()
 
+        self.check_heap_buffers()
+
         eid = 0
 
         for test, checks in enumerate(expected):
@@ -479,6 +481,210 @@ class VK_Descriptor_Heap(rdtest.TestCase):
                         f"{sorted(expected_direct, key=str)}")
 
         self.check_no_validation("direct heap draw debugging")
+
+    def check_heap_buffers(self):
+        """The heap buffer demonstration: a particle simulation dispatch and a triangle drawn from a vertex
+        buffer in the heap, accessing every kind of buffer through handles in push data."""
+        layout_action = self.find_action("Heap Buffer Indices:")
+        if layout_action is None:
+            raise rdtest.TestFailureException("Couldn't find the heap buffer indices marker")
+
+        layout = {}
+        for item in layout_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        direct_layout = {}
+        for item in self.find_action("Direct Heap Indices:").customName.split(":")[1].split():
+            k, v = item.split("=")
+            direct_layout[k] = int(v)
+
+        buf = direct_layout['bufSize']
+        img = direct_layout['imgSize']
+        samp = direct_layout['sampSize']
+
+        RWBuffer = rd.DescriptorType.ReadWriteBuffer
+        CBuffer = rd.DescriptorType.ConstantBuffer
+        Image = rd.DescriptorType.Image
+        Sampler = rd.DescriptorType.Sampler
+
+        resources = {r.name: r.resourceId for r in self.controller.GetResources()}
+
+        # particle simulation dispatch
+        rdtest.log.begin_section("Heap Buffer Dispatch")
+
+        dispatch = self.find_action("Heap Buffer Dispatch").nextAction
+        if not (dispatch.flags & rd.ActionFlags.Dispatch):
+            raise rdtest.TestFailureException(f"Expected a dispatch after the marker, got {dispatch.customName}")
+
+        self.controller.GetDebugMessages()
+        self.set_event(dispatch.eventId, False)
+
+        cs = rd.ShaderStage.Compute
+        self.check_direct_accesses("Heap buffer dispatch", [
+            (cs, RWBuffer, 'res', layout['particlesIn'] * buf, "particlesIn"),
+            (cs, RWBuffer, 'res', layout['particlesOut'] * buf, "particlesOut"),
+            (cs, CBuffer, 'res', layout['simConsts'] * buf, "simConsts"),
+            (cs, RWBuffer, 'res', layout['weights'] * buf, "particleWeights"),
+            (cs, RWBuffer, 'res', layout['stats'] * buf, "particleStats"),
+        ])
+
+        self.check_no_validation("heap buffer dispatch feedback")
+
+        pipe = self.controller.GetVulkanPipelineState()
+        res_heap = pipe.resourceHeap.buffer
+        samp_heap = pipe.samplerHeap.buffer
+
+        refl = self.controller.GetPipelineState().GetShaderReflection(cs)
+        if not refl.debugInfo.debuggable:
+            raise rdtest.TestFailureException(f"Heap buffer dispatch is not debuggable: {refl.debugInfo.debugStatus}")
+
+        num = 8
+        out_data = self.controller.GetBufferData(resources["particlesOut"], 0, 32 * num)
+
+        # each particle starts at (i, 0, 0, 1) with velocity (0.5, 1, 0, 0), gravity -10 scaled by a weight of
+        # 1 + 0.25 * i, dt = 0.1
+        for i in range(num):
+            w = 1.0 + 0.25 * i
+            vel = [0.5, 1.0 - 10.0 * 0.1 * w, 0.0, 0.0]
+            pos = [i + vel[0] * 0.1, vel[1] * 0.1, 0.0, 1.0]
+            written = list(struct.unpack_from("8f", out_data, i * 32))
+            if not rdtest.value_compare(written, pos + vel, eps=1.0E-5):
+                raise rdtest.TestFailureException(f"Particle {i} is {written}, expected {pos + vel}")
+
+        # the counter is reset before the dispatch, and incremented once per particle
+        count = struct.unpack_from("I", self.controller.GetBufferData(resources["particleStats"], 0, 4), 0)[0]
+        if count != num:
+            raise rdtest.TestFailureException(f"Particle stats counter is {count}, expected {num}")
+
+        rdtest.log.success("Heap buffer dispatch output is as expected")
+
+        for x in [0, 3, 7]:
+            written = list(struct.unpack_from("8f", out_data, x * 32))
+
+            with self.debug_thread((0, 0, 0), (x, 0, 0)) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                pos = list(self.find_last_source_var(debug.trace, variables, 'p.pos').value.f32v[0:4])
+                vel = list(self.find_last_source_var(debug.trace, variables, 'p.vel').value.f32v[0:4])
+                weight = self.find_last_source_var(debug.trace, variables, 'weight').value.f32v[0]
+
+                if not rdtest.value_compare(pos + vel, written, eps=1.0E-5):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} debugged particle {pos + vel}, the dispatch wrote {written}")
+
+                if not rdtest.value_compare(weight, 1.0 + 0.25 * x, eps=1.0E-5):
+                    raise rdtest.TestFailureException(f"Thread {x} debugged weight {weight}")
+
+                # the atomic increment returns the counter before this thread's increment, which starts at
+                # 0 for the dispatch
+                prev = self.find_last_source_var(debug.trace, variables, 'prev').value.u32v[0]
+                if prev >= num:
+                    raise rdtest.TestFailureException(f"Thread {x} debugged 'prev' is {prev}, expected < {num}")
+
+                direct = self.get_direct_heap_vars(variables, res_heap, samp_heap)
+                expected_direct = {
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['particlesIn'] * buf),
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['particlesOut'] * buf),
+                    (rd.VarType.ConstantBlock, CBuffer, 'res', layout['simConsts'] * buf),
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['weights'] * buf),
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['stats'] * buf),
+                }
+                if not expected_direct.issubset(direct):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} heap descriptor variables {sorted(direct, key=str)} don't include "
+                        f"{sorted(expected_direct, key=str)}")
+
+                rdtest.log.success(f"Thread {x} debugged in {cycles} cycles, particle {pos} {vel} as expected")
+
+        self.check_no_validation("heap buffer dispatch debugging")
+
+        rdtest.log.end_section("Heap Buffer Dispatch")
+
+        # triangle drawn from a vertex buffer in the heap
+        rdtest.log.begin_section("Heap Buffer Draw")
+
+        draw = self.find_action("Heap Buffer Draw").nextAction
+
+        self.controller.GetDebugMessages()
+        self.set_event(draw.eventId, False)
+
+        vs = rd.ShaderStage.Vertex
+        ps = rd.ShaderStage.Pixel
+        self.check_direct_accesses("Heap buffer draw", [
+            (vs, RWBuffer, 'res', layout['verts'] * buf, "bufferDrawVerts"),
+            (ps, CBuffer, 'res', layout['drawConsts'] * buf, "bufferDrawConsts"),
+            (ps, Image, 'res', layout['tex'] * img, "bufferDrawTex"),
+            (ps, Sampler, 'samp', layout['samp'] * samp, None),
+        ])
+
+        self.check_no_validation("heap buffer draw feedback")
+
+        for stage in (vs, ps):
+            refl = self.controller.GetPipelineState().GetShaderReflection(stage)
+            if not refl.debugInfo.debuggable:
+                raise rdtest.TestFailureException(
+                    f"Heap buffer draw {stage} is not debuggable: {refl.debugInfo.debugStatus}")
+
+        verts = [
+            ([-0.8, 0.8, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [0.0, 0.0]),
+            ([0.8, 0.8, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [1.0, 0.0]),
+            ([0.0, -0.8, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.5, 1.0]),
+        ]
+
+        for vtx, (exp_pos, exp_col, exp_uv) in enumerate(verts):
+            with self.debug_vertex(vtx, 0, vtx, 0) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                pos = list(self.find_last_source_var(debug.trace, variables, 'ret.pos').value.f32v[0:4])
+                col = list(self.find_last_source_var(debug.trace, variables, 'ret.col').value.f32v[0:4])
+                uv = list(self.find_last_source_var(debug.trace, variables, 'ret.uv').value.f32v[0:2])
+
+                if not rdtest.value_compare(pos + col + uv, exp_pos + exp_col + exp_uv, eps=1.0E-5):
+                    raise rdtest.TestFailureException(
+                        f"Vertex {vtx} debugged {pos} {col} {uv}, expected {exp_pos} {exp_col} {exp_uv}")
+
+                direct = self.get_direct_heap_vars(variables, res_heap, samp_heap)
+                expected_direct = (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['verts'] * buf)
+                if expected_direct not in direct:
+                    raise rdtest.TestFailureException(
+                        f"Vertex {vtx} heap descriptor variables {sorted(direct, key=str)} don't include "
+                        f"{expected_direct}")
+
+                rdtest.log.success(f"Vertex {vtx} debugged in {cycles} cycles, position {pos} colour {col}")
+
+        v = self.controller.GetPipelineState().GetViewport(0)
+        out = self.controller.GetPipelineState().GetOutputTargets()[0].resource
+
+        # the centre of the triangle is a mix of the vertex colours, tinted by (1, 0.5, 1, 1)
+        for fx, fy in [(0.5, 0.633), (0.5, 0.8), (0.3, 0.85)]:
+            x = int(v.x + v.width * fx)
+            y = int(v.y + v.height * fy)
+
+            picked = list(self.controller.PickPixel(out, x, y, rd.Subresource(), rd.CompType.Typeless).floatValue)
+            if picked[1] > 0.51 or (picked[0] + picked[2]) < 0.1:
+                raise rdtest.TestFailureException(f"Heap buffer draw pixel {x},{y} is {picked}, not a tinted triangle")
+
+            # compares the debugged output against the real output
+            self.check_debug_pixel(x, y)
+
+            with self.debug_pixel(x, y, rd.DebugPixelInputs()) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                direct = self.get_direct_heap_vars(variables, res_heap, samp_heap)
+                expected_direct = {
+                    (rd.VarType.ConstantBlock, CBuffer, 'res', layout['drawConsts'] * buf),
+                    (rd.VarType.ReadOnlyResource, Image, 'res', layout['tex'] * img),
+                    (rd.VarType.Sampler, Sampler, 'samp', layout['samp'] * samp),
+                }
+                if not expected_direct.issubset(direct):
+                    raise rdtest.TestFailureException(
+                        f"Pixel {x},{y} heap descriptor variables {sorted(direct, key=str)} don't include "
+                        f"{sorted(expected_direct, key=str)}")
+
+        self.check_no_validation("heap buffer draw debugging")
+
+        rdtest.log.end_section("Heap Buffer Draw")
 
     def check_direct_heap_image_debug(self, layout):
         """Debug threads of the image-only direct heap dispatch, which samples a texture with a sampler
