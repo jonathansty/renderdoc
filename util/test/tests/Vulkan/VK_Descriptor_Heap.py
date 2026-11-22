@@ -44,6 +44,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_heap_descriptors()
 
+        self.check_mapped_accesses()
+
         self.check_direct_heap_access()
 
         self.check_heap_buffers()
@@ -285,6 +287,104 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             raise rdtest.TestFailureException(f"Unexpected sampler heap location name {locs[0].logicalBindName}")
 
         rdtest.log.success("Heap descriptors decoded as expected")
+
+    def check_mapped_accesses(self):
+        """Static descriptor access for set/binding resources mapped to the heaps by the tests' pipelines"""
+        layout_action = self.find_action("Heap Layout:")
+
+        if layout_action is None:
+            raise rdtest.TestFailureException("Couldn't find the heap layout marker")
+
+        layout = {}
+        for item in layout_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        img_stride = layout['imgStride']
+        buf_stride = layout['bufStride']
+
+        frag = rd.ShaderStage.Fragment
+        ssbo_types = (rd.DescriptorType.Buffer, rd.DescriptorType.ReadWriteBuffer)
+
+        # (stage, type, heap, byte offset, resource name). Samplers have no resource. The embedded sampler in test 6
+        # isn't in either heap, so it is not reported yet
+        expected = [
+            [(frag, rd.DescriptorType.Image, 'res', layout['tex'], 'tex0'),
+             (frag, rd.DescriptorType.Sampler, 'samp', layout['samp'], None)],
+            [(frag, rd.DescriptorType.ConstantBuffer, 'res', layout['ubo'], 'ubo')],
+            [(frag, 'ssbo', 'res', layout['ssbo'], 'ssbo0')],
+            [(frag, 'ssbo', 'res', layout['ssbo'] + buf_stride, 'ssbo1')],
+            [(frag, rd.DescriptorType.Image, 'res', layout['texArray'], 'texArray0'),
+             (frag, rd.DescriptorType.Sampler, 'samp', layout['samp'], None)],
+            [(frag, rd.DescriptorType.Image, 'res', layout['texArray'] + img_stride, 'texArray1'),
+             (frag, rd.DescriptorType.Sampler, 'samp', layout['samp'], None)],
+            [(frag, rd.DescriptorType.Image, 'res', layout['tex'], 'tex0')],
+            [(frag, rd.DescriptorType.Image, 'res', layout['tex'], 'tex0'),
+             (frag, rd.DescriptorType.Sampler, 'samp', layout['customSamp'], None)],
+        ]
+
+        eid = 0
+
+        for test, exp in enumerate(expected):
+            draw = self.find_action(f"Heap Test {test}", eid)
+
+            if draw is None:
+                raise rdtest.TestFailureException(f"Couldn't find marker for Heap Test {test}")
+
+            eid = draw.eventId
+
+            self.controller.GetDebugMessages()
+
+            self.set_event(draw.nextAction.eventId, False)
+
+            pipe = self.controller.GetVulkanPipelineState()
+            heaps = {'res': pipe.resourceHeap.buffer, 'samp': pipe.samplerHeap.buffer}
+
+            got = []
+            for a in self.controller.GetDescriptorAccess():
+                if a.index == rd.DescriptorAccess.NoShaderBinding:
+                    continue
+
+                if a.descriptorStore == rd.ResourceId():
+                    raise rdtest.TestFailureException(f"Heap Test {test}: access {a.type} {a.index} has no store")
+
+                # push constants and specialisation constants are not heap mapped
+                if a.type == rd.DescriptorType.ConstantBuffer:
+                    refl = self.controller.GetPipelineState().GetShaderReflection(a.stage)
+                    if not refl.constantBlocks[a.index].bufferBacked:
+                        continue
+
+                heap = [k for k, v in heaps.items() if v == a.descriptorStore]
+                if len(heap) != 1:
+                    raise rdtest.TestFailureException(
+                        f"Heap Test {test}: access {a.type} {a.index} has unexpected store {a.descriptorStore}")
+
+                r = rd.DescriptorRange(a)
+
+                if a.type == rd.DescriptorType.Sampler:
+                    samp = self.controller.GetSamplerDescriptors(a.descriptorStore, [r])[0]
+                    border = [round(x, 2) for x in samp.borderColorValue.floatValue]
+                    if test == 7 and border != [0.5, 0.25, 0.75, 1.0]:
+                        raise rdtest.TestFailureException(f"Heap Test {test}: sampler border is {border}")
+                    if test != 7 and samp.addressU != rd.AddressMode.ClampEdge:
+                        raise rdtest.TestFailureException(f"Heap Test {test}: sampler address is {samp.addressU}")
+                    res = None
+                    typ = a.type
+                else:
+                    desc = self.controller.GetDescriptors(a.descriptorStore, [r])[0]
+                    res = self.get_resource(desc.resource).name if desc.resource != rd.ResourceId() else None
+                    typ = 'ssbo' if a.type in ssbo_types else a.type
+
+                got.append((a.stage, typ, heap[0], a.byteOffset, res))
+
+            if sorted(got, key=str) != sorted(exp, key=str):
+                raise rdtest.TestFailureException(
+                    f"Heap Test {test}: mapped accesses don't match. Got: {sorted(got, key=str)} "
+                    f"Expected: {sorted(exp, key=str)}")
+
+            self.check_no_validation(f"Heap Test {test} mapped access")
+
+            rdtest.log.success(f"Heap Test {test} reported the expected {len(got)} mapped accesses")
 
     def check_no_validation(self, what):
         msgs = [m for m in self.controller.GetDebugMessages()

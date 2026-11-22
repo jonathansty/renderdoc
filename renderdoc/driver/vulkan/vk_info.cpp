@@ -26,11 +26,13 @@
 #include "core/settings.h"
 #include "lz4/lz4.h"
 #include "vk_core.h"
+#include "vk_heap_mapping.h"
 
 // for compatibility we use the same DXBC name since it's now configured by the UI
 RDOC_EXTERN_CONFIG(rdcarray<rdcstr>, DXBC_Debug_SearchDirPaths);
 
 ResourceId VulkanCreationInfo::pushConstantDescriptorStorage;
+ResourceId VulkanCreationInfo::heapMappedStorage;
 rdcarray<ResourceId> VulkanCreationInfo::descriptorSetStorage;
 rdcarray<ResourceId> VulkanCreationInfo::descriptorBufferStorage;
 rdcarray<ResourceId> VulkanCreationInfo::inlineBufferStorage;
@@ -1167,6 +1169,84 @@ static void ProcessStaticDescriptorAccess(VulkanResourceManager *resourceMan,
   }
 }
 
+// Heap pipelines and shader objects have no set layouts, instead set/binding resources are mapped to
+// the heaps by VkShaderDescriptorSetAndBindingMappingInfoEXT. Where the descriptor lives can depend
+// on push data and the bound heaps, so here we only record a static access to a placeholder store.
+// GetDescriptorAccess resolves it at the event being replayed, re-deriving the set/binding from the
+// reflection index and the access type.
+static void ProcessStaticHeapMappedDescriptorAccess(
+    const ShaderReflection *refl,
+    const rdcarray<VulkanCreationInfo::ShaderEntry::DescriptorMapping> &mappings,
+    rdcarray<DescriptorAccess> &descriptorAccess)
+{
+  if(!refl || mappings.empty())
+    return;
+
+  DescriptorAccess access;
+  access.stage = refl->stage;
+  access.descriptorStore = VulkanCreationInfo::heapMappedStorage;
+  access.byteOffset = 0;
+  access.byteSize = 1;
+
+  // arrayed descriptors will be handled with bindless feedback (TODO(heap 5.4))
+  // embedded samplers are not in any heap (TODO(heap 5.3)) so they are never reported here
+  auto add = [&](DescriptorType type, uint16_t idx, uint32_t set, uint32_t bind,
+                 VkSpirvResourceTypeFlagsEXT typeMask) {
+    if(typeMask == 0)
+      return;
+
+    const VulkanCreationInfo::ShaderEntry::DescriptorMapping *dm =
+        FindHeapMapping(mappings, set, bind, typeMask);
+    if(!dm)
+      return;
+
+    // plain samplers with an embedded sampler are not in any heap. For combined image samplers the
+    // image part is still in the resource heap
+    if(dm->hasEmbeddedSampler && (typeMask & VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT))
+      return;
+
+    access.type = type;
+    access.index = idx;
+    descriptorAccess.push_back(access);
+  };
+
+  for(uint16_t i = 0; i < refl->constantBlocks.size(); i++)
+  {
+    const ConstantBlock &bind = refl->constantBlocks[i];
+    if(bind.bindArraySize > 1 || !bind.bufferBacked)
+      continue;
+    add(DescriptorType::ConstantBuffer, i, bind.fixedBindSetOrSpace, bind.fixedBindNumber,
+        SpirvResourceTypeForBinding(bind));
+  }
+
+  for(uint16_t i = 0; i < refl->samplers.size(); i++)
+  {
+    const ShaderSampler &bind = refl->samplers[i];
+    if(bind.bindArraySize > 1)
+      continue;
+    add(DescriptorType::Sampler, i, bind.fixedBindSetOrSpace, bind.fixedBindNumber,
+        SpirvResourceTypeForBinding(bind));
+  }
+
+  for(uint16_t i = 0; i < refl->readOnlyResources.size(); i++)
+  {
+    const ShaderResource &bind = refl->readOnlyResources[i];
+    if(bind.bindArraySize > 1)
+      continue;
+    add(bind.descriptorType, i, bind.fixedBindSetOrSpace, bind.fixedBindNumber,
+        SpirvResourceTypeForBinding(bind));
+  }
+
+  for(uint16_t i = 0; i < refl->readWriteResources.size(); i++)
+  {
+    const ShaderResource &bind = refl->readWriteResources[i];
+    if(bind.bindArraySize > 1)
+      continue;
+    add(bind.descriptorType, i, bind.fixedBindSetOrSpace, bind.fixedBindNumber,
+        SpirvResourceTypeForBinding(bind));
+  }
+}
+
 void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
                                             VulkanCreationInfo &info, ResourceId id,
                                             const VkShaderCreateInfoEXT *pCreateInfo)
@@ -1255,6 +1335,8 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   if(descriptorHeap)
   {
     ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, {});
+    ProcessStaticHeapMappedDescriptorAccess(shad.refl, shad.descriptorMappings,
+                                            staticDescriptorAccess);
     return;
   }
 
@@ -2000,7 +2082,11 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
   {
     descSetLayouts.clear();
     for(const ShaderEntry &shad : shaders)
+    {
       ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, {});
+      ProcessStaticHeapMappedDescriptorAccess(shad.refl, shad.descriptorMappings,
+                                              staticDescriptorAccess);
+    }
     return;
   }
 
@@ -2207,7 +2293,11 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
   if(descriptorHeap)
   {
     for(const ShaderEntry &shad : shaders)
+    {
       ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, {});
+      ProcessStaticHeapMappedDescriptorAccess(shad.refl, shad.descriptorMappings,
+                                              staticDescriptorAccess);
+    }
     return;
   }
 

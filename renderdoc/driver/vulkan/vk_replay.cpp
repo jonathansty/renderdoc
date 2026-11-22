@@ -38,6 +38,7 @@
 #include "strings/string_utils.h"
 #include "vk_core.h"
 #include "vk_debug.h"
+#include "vk_heap_mapping.h"
 #include "vk_resources.h"
 #include "vk_shader_cache.h"
 
@@ -3048,11 +3049,132 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
   const ActionDescription *action = m_pDriver->GetAction(eventId);
   const bool compute = action && bool(action->flags & ActionFlags::Dispatch);
 
+  // set/binding resources mapped into the descriptor heaps by heap pipelines and shader objects have
+  // a placeholder store. Resolve it against the heaps and push data bound now, using the mappings
+  // of the shader that declared the binding
+  auto resolveHeapMapped = [this, &state, action, compute](
+                               DescriptorAccess &access,
+                               const VulkanCreationInfo::ShaderEntry &shad) {
+    // as with descriptor buffers, don't display descriptor access if no action is selected or the
+    // access comes from the alternate pipeline as the heap/push data state could be unrelated
+    if(action == NULL || ((!compute && access.stage == ShaderStage::Compute) ||
+                          (compute && access.stage != ShaderStage::Compute)))
+    {
+      access.descriptorStore = ResourceId();
+      return;
+    }
+
+    // the placeholder only records the reflection index, re-derive the set/binding from it
+    uint32_t set = 0, bind = 0;
+    VkSpirvResourceTypeFlagsEXT typeMask = 0;
+
+    if(shad.refl)
+    {
+      switch(access.type)
+      {
+        case DescriptorType::ConstantBuffer:
+          if(access.index < shad.refl->constantBlocks.size())
+          {
+            const ConstantBlock &b = shad.refl->constantBlocks[access.index];
+            set = b.fixedBindSetOrSpace;
+            bind = b.fixedBindNumber;
+            typeMask = SpirvResourceTypeForBinding(b);
+          }
+          break;
+        case DescriptorType::Sampler:
+          if(access.index < shad.refl->samplers.size())
+          {
+            const ShaderSampler &b = shad.refl->samplers[access.index];
+            set = b.fixedBindSetOrSpace;
+            bind = b.fixedBindNumber;
+            typeMask = SpirvResourceTypeForBinding(b);
+          }
+          break;
+        case DescriptorType::ReadWriteImage:
+        case DescriptorType::ReadWriteTypedBuffer:
+        case DescriptorType::ReadWriteBuffer:
+          if(access.index < shad.refl->readWriteResources.size())
+          {
+            const ShaderResource &b = shad.refl->readWriteResources[access.index];
+            set = b.fixedBindSetOrSpace;
+            bind = b.fixedBindNumber;
+            typeMask = SpirvResourceTypeForBinding(b);
+          }
+          break;
+        default:
+          if(access.index < shad.refl->readOnlyResources.size())
+          {
+            const ShaderResource &b = shad.refl->readOnlyResources[access.index];
+            set = b.fixedBindSetOrSpace;
+            bind = b.fixedBindNumber;
+            typeMask = SpirvResourceTypeForBinding(b);
+          }
+          break;
+      }
+    }
+
+    access.descriptorStore = ResourceId();
+
+    if(typeMask == 0)
+      return;
+
+    // push data shares storage with push constants, but is only meaningful if it was pushed with
+    // vkCmdPushDataEXT
+    const HeapMappingResult res =
+        ResolveHeapMapping(shad.descriptorMappings, set, bind, typeMask, 0,
+                           state.pushDataHeap ? state.pushconsts : NULL, state.pushConstSize);
+
+    const VulkanRenderState::DescriptorHeapBind *heap = NULL;
+    if(res.kind == HeapMappingKind::ResourceHeap)
+      heap = &state.resourceHeap;
+    else if(res.kind == HeapMappingKind::SamplerHeap)
+      heap = &state.samplerHeap;
+
+    // TODO(heap 5.3/5.6): embedded samplers, push address, heap data and indirect sources are not
+    // resolved to a descriptor store yet. Uniform buffers backed by push data could be shown like
+    // push constants (store = GetPushConstantCommandBuffer()) once the UI handles the offset.
+    // The sampler part of a combined image sampler lives in the sampler heap which can't be
+    // expressed by a single access, so only the image part is reported (heap combined image
+    // sampler descriptors are image-only)
+    if(heap == NULL || !heap->valid)
+      return;
+
+    ResourceId id;
+    uint64_t offs = 0;
+    m_pDriver->GetResIDFromAddr(heap->address, id, offs);
+
+    if(id == ResourceId())
+      return;
+
+    access.descriptorStore = id;
+    access.byteOffset = uint32_t(res.byteOffset + offs);
+    access.byteSize = m_pDriver->HeapDescriptorSize(MakeVkDescriptorType(access.type, false));
+  };
+
+  auto appendStatic = [&ret, &resolveHeapMapped](const rdcarray<DescriptorAccess> &src,
+                                                 const VulkanCreationInfo::ShaderEntry *shaders,
+                                                 bool perStage) {
+    for(const DescriptorAccess &a : src)
+    {
+      ret.push_back(a);
+      if(a.descriptorStore == VulkanCreationInfo::heapMappedStorage)
+        resolveHeapMapped(ret.back(), perStage ? shaders[(uint32_t)a.stage] : shaders[0]);
+    }
+  };
+
   if(state.graphics.pipeline != ResourceId())
-    ret.append(m_pDriver->m_CreationInfo.m_Pipeline[state.graphics.pipeline].staticDescriptorAccess);
+  {
+    const VulkanCreationInfo::Pipeline &p =
+        m_pDriver->m_CreationInfo.m_Pipeline[state.graphics.pipeline];
+    appendStatic(p.staticDescriptorAccess, p.shaders, true);
+  }
 
   if(state.compute.pipeline != ResourceId())
-    ret.append(m_pDriver->m_CreationInfo.m_Pipeline[state.compute.pipeline].staticDescriptorAccess);
+  {
+    const VulkanCreationInfo::Pipeline &p =
+        m_pDriver->m_CreationInfo.m_Pipeline[state.compute.pipeline];
+    appendStatic(p.staticDescriptorAccess, p.shaders, true);
+  }
 
   if(state.graphics.shaderObject)
   {
@@ -3062,14 +3184,19 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
         continue;
       ResourceId shadid = state.shaderObjects[i];
       if(shadid != ResourceId())
-        ret.append(m_pDriver->m_CreationInfo.m_ShaderObject[shadid].staticDescriptorAccess);
+      {
+        const VulkanCreationInfo::ShaderObject &so = m_pDriver->m_CreationInfo.m_ShaderObject[shadid];
+        appendStatic(so.staticDescriptorAccess, &so.shad, false);
+      }
     }
   }
 
   if(state.compute.shaderObject && state.shaderObjects[(uint32_t)ShaderStage::Compute] != ResourceId())
-    ret.append(m_pDriver->m_CreationInfo
-                   .m_ShaderObject[state.shaderObjects[(uint32_t)ShaderStage::Compute]]
-                   .staticDescriptorAccess);
+  {
+    const VulkanCreationInfo::ShaderObject &so =
+        m_pDriver->m_CreationInfo.m_ShaderObject[state.shaderObjects[(uint32_t)ShaderStage::Compute]];
+    appendStatic(so.staticDescriptorAccess, &so.shad, false);
+  }
 
   for(DescriptorAccess &access : ret)
   {

@@ -908,6 +908,9 @@ struct VulkanCreationInfo
 
   // the fake ID of the 'command buffer' descriptor store for push constants
   static ResourceId pushConstantDescriptorStorage;
+  // the fake ID of the placeholder store for set/binding resources mapped to descriptor heaps,
+  // resolved to the real heap and offset when querying descriptor access at an event
+  static ResourceId heapMappedStorage;
   // fake IDs for each set/buffer
   static rdcarray<ResourceId> descriptorSetStorage;
   static rdcarray<ResourceId> descriptorBufferStorage;
