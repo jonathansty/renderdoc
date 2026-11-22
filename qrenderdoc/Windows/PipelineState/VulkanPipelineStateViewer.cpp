@@ -582,7 +582,64 @@ void VulkanPipelineStateViewer::OnCaptureClosed()
 
 void VulkanPipelineStateViewer::OnEventChanged(uint32_t eventId)
 {
-  setState();
+  // direct descriptor heap accesses have no shader binding, so their names come from the logical
+  // locations in the heap
+  m_Ctx.Replay().AsyncInvoke([this](IReplayController *r) {
+    rdcarray<DescriptorAccess> allAccess = m_Ctx.CurPipelineState().GetDescriptorAccess();
+
+    rdcarray<DescriptorAccess> access;
+    for(const DescriptorAccess &acc : allAccess)
+      if(acc.index == DescriptorAccess::NoShaderBinding)
+        access.push_back(acc);
+
+    std::sort(access.begin(), access.end(), [](const DescriptorAccess &a, const DescriptorAccess &b) {
+      if(a.descriptorStore != b.descriptorStore)
+        return a.descriptorStore < b.descriptorStore;
+      return a.byteOffset < b.byteOffset;
+    });
+
+    ResourceId descriptorStore;
+    rdcarray<DescriptorRange> ranges;
+
+    rdcarray<DescriptorLogicalLocation> locations;
+
+    for(const DescriptorAccess &acc : access)
+    {
+      if(acc.descriptorStore != descriptorStore)
+      {
+        if(descriptorStore != ResourceId())
+          locations.append(r->GetDescriptorLocations(descriptorStore, ranges));
+
+        descriptorStore = acc.descriptorStore;
+        ranges.clear();
+      }
+
+      // if the last range is contiguous with this access, append this access as a new range to query
+      if(!ranges.empty() && ranges.back().descriptorSize == acc.byteSize &&
+         ranges.back().offset + ranges.back().descriptorSize == acc.byteOffset &&
+         ranges.back().type == acc.type)
+      {
+        ranges.back().count++;
+        continue;
+      }
+
+      DescriptorRange range = acc;
+      ranges.push_back(range);
+    }
+
+    if(descriptorStore != ResourceId())
+      locations.append(r->GetDescriptorLocations(descriptorStore, ranges));
+
+    // we only write to m_Locations on the GUI thread so we know there's no race here.
+    GUIInvoke::call(this, [this, access = std::move(access), locations = std::move(locations)]() {
+      m_Locations.clear();
+
+      for(size_t i = 0; i < qMin(access.size(), locations.size()); i++)
+        m_Locations[{access[i].descriptorStore, access[i].byteOffset}] = locations[i];
+
+      setState();
+    });
+  });
 }
 
 void VulkanPipelineStateViewer::SelectPipelineStage(PipelineStage stage)
@@ -1262,8 +1319,6 @@ void VulkanPipelineStateViewer::addResourceRow(const ShaderResource *shaderRes,
     if(used.access.index == DescriptorAccess::NoShaderBinding)
     {
       slotname = m_Locations[{used.access.descriptorStore, used.access.byteOffset}].logicalBindName;
-
-      slotname += QFormatStr("[%1]").arg(used.access.arrayElement);
     }
     else if(shaderRes)
     {
@@ -1609,8 +1664,6 @@ void VulkanPipelineStateViewer::addConstantBlockRow(const ConstantBlock *cblock,
     if(used.access.index == DescriptorAccess::NoShaderBinding)
     {
       slotname = m_Locations[{used.access.descriptorStore, used.access.byteOffset}].logicalBindName;
-
-      slotname += QFormatStr("[%1]").arg(used.access.arrayElement);
     }
     else if(cblock)
     {
@@ -1789,7 +1842,13 @@ void VulkanPipelineStateViewer::setShaderState(const VKPipe::Pipeline &pipe,
     }
   }
 
-  if(descBuf)
+  // descriptor heap pipelines have no descriptor sets, show the bound heaps instead
+  const VKPipe::State *vkState = m_Ctx.CurVulkanPipelineState();
+  const bool heaps = pipe.descriptorSets.isEmpty() && vkState &&
+                     (vkState->resourceHeap.buffer != ResourceId() ||
+                      vkState->samplerHeap.buffer != ResourceId());
+
+  if(descBuf || heaps)
   {
     descSets->setHeaderText(2, tr(" Buffer"));
     descSets->header()->showSection(3);    // buffer offset
@@ -1805,7 +1864,25 @@ void VulkanPipelineStateViewer::setShaderState(const VKPipe::Pipeline &pipe,
   }
 
   descSets->clear();
-  if(descBuf)
+  if(heaps)
+  {
+    const VKPipe::DescriptorHeap *heapBinds[2] = {&vkState->resourceHeap, &vkState->samplerHeap};
+    const QString heapNames[2] = {tr("Resource Heap"), tr("Sampler Heap")};
+
+    for(int h = 0; h < 2; h++)
+    {
+      if(heapBinds[h]->buffer == ResourceId())
+        continue;
+
+      RDTreeWidgetItem *item = new RDTreeWidgetItem({heapNames[h], QString(), heapBinds[h]->buffer,
+                                                     qulonglong(heapBinds[h]->offset), QString(),
+                                                     tr("%1 bytes").arg(heapBinds[h]->size)});
+      // negative tags identify heaps, see descSet_itemActivated
+      item->setTag(-1 - h);
+      descSets->addTopLevelItem(item);
+    }
+  }
+  else if(descBuf)
   {
     for(uint32_t i = 0; i < pipe.descriptorSets.size(); i++)
     {
@@ -1874,7 +1951,8 @@ rdcpair<uint32_t, uint32_t> GetSetAndBind(const UsedDescriptor &a, const ShaderR
 {
   rdcpair<uint32_t, uint32_t> ret = {~0U, ~0U};
 
-  if(!refl)
+  // direct descriptor heap accesses have no set/binding
+  if(!refl || a.access.index == DescriptorAccess::NoShaderBinding)
     return ret;
 
   DescriptorCategory category = CategoryForDescriptorType(a.access.type);
@@ -2339,10 +2417,12 @@ void VulkanPipelineStateViewer::setState()
 
                 // non-set associated things (specialisation constants, push constants, etc) to the end
                 if(a.access.type == DescriptorType::ConstantBuffer &&
+                   a.access.index != DescriptorAccess::NoShaderBinding &&
                    !refl->constantBlocks[a.access.index].bufferBacked)
                   aBind.first = ~0U;
 
                 if(b.access.type == DescriptorType::ConstantBuffer &&
+                   b.access.index != DescriptorAccess::NoShaderBinding &&
                    !refl->constantBlocks[b.access.index].bufferBacked)
                   bBind.first = ~0U;
 
@@ -3315,6 +3395,21 @@ void VulkanPipelineStateViewer::descSet_itemActivated(RDTreeWidgetItem *item, in
 
   int index = item->tag().toInt();
 
+  if(index < 0)
+  {
+    // descriptor heap
+    const VKPipe::DescriptorHeap &heap = index == -1 ? m_Ctx.CurVulkanPipelineState()->resourceHeap
+                                                     : m_Ctx.CurVulkanPipelineState()->samplerHeap;
+
+    if(heap.buffer != ResourceId())
+    {
+      IBufferViewer *viewer = m_Ctx.ViewBuffer(heap.offset, 0, heap.buffer);
+
+      m_Ctx.AddDockWindow(viewer->Widget(), DockReference::AddTo, this);
+    }
+    return;
+  }
+
   const rdcarray<VKPipe::DescriptorSet> &descSets =
       stage->stage == ShaderStage::Compute ? m_Ctx.CurVulkanPipelineState()->compute.descriptorSets
                                            : m_Ctx.CurVulkanPipelineState()->graphics.descriptorSets;
@@ -3773,8 +3868,6 @@ void VulkanPipelineStateViewer::exportHTML(QXmlStreamWriter &xml, const VKPipe::
     if(used.access.index == DescriptorAccess::NoShaderBinding)
     {
       slotname = m_Locations[{used.access.descriptorStore, used.access.byteOffset}].logicalBindName;
-
-      slotname += QFormatStr("[%1]").arg(used.access.arrayElement);
     }
     else
     {
@@ -3958,8 +4051,6 @@ void VulkanPipelineStateViewer::exportHTML(QXmlStreamWriter &xml, const VKPipe::
       if(used.access.index == DescriptorAccess::NoShaderBinding)
       {
         slotname = m_Locations[{used.access.descriptorStore, used.access.byteOffset}].logicalBindName;
-
-        slotname += QFormatStr("[%1]").arg(used.access.arrayElement);
       }
       else if(shaderSamp)
       {
@@ -4622,8 +4713,6 @@ const ShaderResource *VulkanPipelineStateViewer::exportDescriptorHTML(const Used
   if(used.access.index == DescriptorAccess::NoShaderBinding)
   {
     slotname = m_Locations[{used.access.descriptorStore, used.access.byteOffset}].logicalBindName;
-
-    slotname += QFormatStr("[%1]").arg(used.access.arrayElement);
   }
   else if(shaderRes)
   {
