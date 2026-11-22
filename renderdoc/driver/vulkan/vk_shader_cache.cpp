@@ -1239,7 +1239,9 @@ void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &p
       VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
   };
 
-  if(pipeInfo.useCreateFlags2 && m_pDriver->Maintenance5())
+  // descriptor heap pipelines can only be expressed via flags2 - the application chained it so
+  // it's valid to use even when maintenance5 wasn't explicitly enabled (e.g. 1.4 core usage)
+  if(pipeInfo.useCreateFlags2 && (m_pDriver->Maintenance5() || pipeInfo.descriptorHeap))
   {
     createFlags.flags = flags;
 
@@ -1390,7 +1392,9 @@ void VulkanShaderCache::MakeComputePipelineInfo(VkComputePipelineCreateInfo &pip
       VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
   };
 
-  if(pipeInfo.useCreateFlags2 && m_pDriver->Maintenance5())
+  // descriptor heap pipelines can only be expressed via flags2 - the application chained it so
+  // it's valid to use even when maintenance5 wasn't explicitly enabled (e.g. 1.4 core usage)
+  if(pipeInfo.useCreateFlags2 && (m_pDriver->Maintenance5() || pipeInfo.descriptorHeap))
   {
     createFlags.flags = flags;
 

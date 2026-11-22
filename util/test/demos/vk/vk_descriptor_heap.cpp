@@ -485,8 +485,9 @@ float4 psmain(V2F IN) : SV_Target0
     if(!maint5Feats.maintenance5)
       Avail = "feature 'maintenance5' not available";
 
-    maint5Feats.pNext = (void *)devInfoNext;
-    devInfoNext = &maint5Feats;
+    // deliberately don't enable the maintenance5 feature: heap pipelines chain
+    // VkPipelineCreateFlags2CreateInfo regardless, and RenderDoc must preserve it when recreating
+    // pipelines even when maintenance5 isn't enabled (matches real-world applications)
 
     static VkPhysicalDeviceCustomBorderColorFeaturesEXT customBorderFeats = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
