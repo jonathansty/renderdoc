@@ -122,6 +122,51 @@ void main()
 
 )EOSHADER";
 
+  // fragment shader for arrayed set/binding mappings, dynamically indexed from push data. The array
+  // elements used are decided by the push data so feedback is needed to find them
+  const std::string arrayPixel = R"EOSHADER(
+#version 460 core
+
+layout(location = 0) in vec2 uv;
+
+layout(location = 0, index = 0) out vec4 Color;
+
+layout(push_constant) uniform PushBlock
+{
+  uint ssboBase;
+  uint texMask;
+  uint ssboElem;
+} pc;
+
+// resource heap, constant offset with an array stride
+layout(set = 3, binding = 0) uniform texture2D texArr[4];
+// sampler heap, constant offset
+layout(set = 3, binding = 1) uniform sampler arrSamp;
+
+// resource heap, push index (base of the array in the push data) with an array stride
+layout(set = 4, binding = 0, std430) readonly buffer ssbo_block
+{
+  vec4 col;
+} ssboArr[2];
+
+void main()
+{
+  vec3 sum = vec3(0);
+
+  // only the textures selected by the mask are read
+  for(int i = 0; i < 4; i++)
+  {
+    if((pc.texMask & (1u << i)) != 0u)
+      sum += texture(sampler2D(texArr[i], arrSamp), uv).rgb;
+  }
+
+  sum += ssboArr[pc.ssboElem].col.rgb;
+
+  Color = vec4(sum, 1.0f);
+}
+
+)EOSHADER";
+
   static const uint32_t NUM_TESTS = 8;
 
   // shaders that index the heaps directly with SPV_EXT_descriptor_heap, without any set/binding
@@ -2009,6 +2054,13 @@ float4 psmain(V2F IN) : SV_Target0
     uint32_t texIndex;
   };
 
+  struct ArrayPushData
+  {
+    uint32_t ssboBase;
+    uint32_t texMask;
+    uint32_t ssboElem;
+  };
+
   std::vector<AllocatedImage> images;
   std::vector<AllocatedBuffer> buffers;
 
@@ -2027,6 +2079,13 @@ float4 psmain(V2F IN) : SV_Target0
     // the Slang compute shader declares these capabilities for its RWTexture2D
     features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+
+    // the array draw indexes arrays of sampled images and storage buffers dynamically
+    features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    features.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
+
+    // the array draw is in an extra row below the 4x4 grid of cells (see cellH in the frame)
+    screenHeight = screenHeight * 5 / 4;
 
     VulkanGraphicsTest::Prepare(argc, argv);
 
@@ -2321,6 +2380,17 @@ float4 psmain(V2F IN) : SV_Target0
     const uint32_t ssboOffset = (uint32_t)Align(uboOffset + bufStride, 0x100);
     const uint32_t texArrayOffset = (uint32_t)Align(ssboOffset + bufStride * 2, 0x100);
 
+    // arrayed bindings: 4 images with an array stride, then 4 buffers
+    const uint32_t arrTexOffset = (uint32_t)Align(texArrayOffset + imgStride * 2, 0x100);
+    const uint32_t arrSsboOffset = (uint32_t)Align(arrTexOffset + imgStride * 4, 0x100);
+    const uint32_t arrSsboBase = 1;
+
+    if(arrSsboOffset + bufStride * 4 > 0x1000)
+    {
+      TEST_ERROR("Descriptor sizes are too big to fit the array descriptors");
+      return 4;
+    }
+
     // sampler heap offsets
     const uint32_t sampOffset = 0;
     const uint32_t customSampOffset = (uint32_t)Align(sampOffset + sampStride, 0x100);
@@ -2444,6 +2514,32 @@ float4 psmain(V2F IN) : SV_Target0
                             ssboAddr[i], 0x100);
       WriteImageDescriptor(resPtr + texArrayOffset + imgStride * i, texArray[i],
                            VK_FORMAT_R8G8B8A8_UNORM);
+    }
+
+    // arrayed bindings, each element is a different image/buffer. Textures 0, 1 and 3 are used (summed),
+    // 2 is not. The array of buffers has a base index of 1 from push data and the shader uses element
+    // 1, so buffer 2 is used
+    {
+      VkImage arrTex[4] = {
+          MakeTestImage("arrTex0", Vec4f(0.5f, 0.0f, 0.0f, 1.0f)),
+          MakeTestImage("arrTex1", Vec4f(0.0f, 0.25f, 0.0f, 1.0f)),
+          MakeTestImage("arrTex2", Vec4f(0.9f, 0.9f, 0.9f, 1.0f)),
+          MakeTestImage("arrTex3", Vec4f(0.25f, 0.25f, 0.0f, 1.0f)),
+      };
+      VkDeviceAddress arrSsbo[4] = {
+          MakeTestBuffer("arrSsbo0", Vec4f(0.0f, 0.0f, 0.9f, 1.0f)),
+          MakeTestBuffer("arrSsbo1", Vec4f(0.0f, 0.9f, 0.0f, 1.0f)),
+          MakeTestBuffer("arrSsbo2", Vec4f(0.0f, 0.0f, 0.5f, 1.0f)),
+          MakeTestBuffer("arrSsbo3", Vec4f(0.9f, 0.0f, 0.0f, 1.0f)),
+      };
+
+      for(uint32_t i = 0; i < 4; i++)
+      {
+        WriteImageDescriptor(resPtr + arrTexOffset + imgStride * i, arrTex[i],
+                             VK_FORMAT_R8G8B8A8_UNORM);
+        WriteBufferDescriptor(resPtr + arrSsboOffset + bufStride * i,
+                              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, arrSsbo[i], 0x100);
+      }
     }
 
     vkh::SamplerCreateInfo sampInfo(VK_FILTER_NEAREST);
@@ -2819,6 +2915,59 @@ float4 psmain(V2F IN) : SV_Target0
       tests.push_back(createGraphicsPipeline(pipeCreateInfo));
     }
 
+    // arrayed mappings
+    VkPipeline arrayPipe;
+    {
+      VkDescriptorSetAndBindingMappingEXT arrMappings[3] = {};
+      for(VkDescriptorSetAndBindingMappingEXT &m : arrMappings)
+      {
+        m.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT;
+        m.bindingCount = 1;
+      }
+
+      // set 3, binding 0: array of sampled images at a constant offset, with a stride
+      arrMappings[0].descriptorSet = 3;
+      arrMappings[0].firstBinding = 0;
+      arrMappings[0].resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT;
+      arrMappings[0].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+      arrMappings[0].sourceData.constantOffset.heapOffset = arrTexOffset;
+      arrMappings[0].sourceData.constantOffset.heapArrayStride = (uint32_t)imgStride;
+
+      // set 3, binding 1: sampler at a constant offset in the sampler heap
+      arrMappings[1].descriptorSet = 3;
+      arrMappings[1].firstBinding = 1;
+      arrMappings[1].resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT;
+      arrMappings[1].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+      arrMappings[1].sourceData.constantOffset.heapOffset = sampOffset;
+
+      // set 4, binding 0: array of SSBOs, with the base index from push data and an array stride
+      arrMappings[2].descriptorSet = 4;
+      arrMappings[2].firstBinding = 0;
+      arrMappings[2].resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT |
+                                    VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT;
+      arrMappings[2].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT;
+      arrMappings[2].sourceData.pushIndex.heapOffset = arrSsboOffset;
+      arrMappings[2].sourceData.pushIndex.pushOffset = offsetof(ArrayPushData, ssboBase);
+      arrMappings[2].sourceData.pushIndex.heapIndexStride = (uint32_t)bufStride;
+      arrMappings[2].sourceData.pushIndex.heapArrayStride = (uint32_t)bufStride;
+
+      VkShaderDescriptorSetAndBindingMappingInfoEXT arrMappingInfo = {
+          VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
+      };
+      arrMappingInfo.mappingCount = ARRAY_COUNT(arrMappings);
+      arrMappingInfo.pMappings = arrMappings;
+
+      pipeCreateInfo.stages[0] =
+          CompileShaderModule(vertex, ShaderLang::glsl, ShaderStage::vert, "main");
+      pipeCreateInfo.stages[1] =
+          CompileShaderModule(arrayPixel, ShaderLang::glsl, ShaderStage::frag, "main");
+      pipeCreateInfo.stages[1].pNext = &arrMappingInfo;
+
+      arrayPipe = createGraphicsPipeline(pipeCreateInfo);
+
+      pipeCreateInfo.stages[1].pNext = NULL;
+    }
+
     // direct heap indexing pipelines, with no mappings
     VkPipeline directGraphicsPipe;
     {
@@ -3083,7 +3232,8 @@ float4 psmain(V2F IN) : SV_Target0
       vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
 
       const float cellW = float(screenWidth) / 4.0f;
-      const float cellH = float(screenHeight) / 4.0f;
+      // 4x5 cells, the last row is for the array draw
+      const float cellH = float(screenHeight) / 5.0f;
 
       for(uint32_t t = 0; t < NUM_TESTS; t++)
       {
@@ -3260,6 +3410,34 @@ float4 psmain(V2F IN) : SV_Target0
         vkCmdBindResourceHeapEXT(cmd, &resBind2);
         vkCmdBindSamplerHeapEXT(cmd, &sampBind2);
         directDraw("Heap After Non-Heap");
+      }
+
+      // arrayed mappings, in the extra row below the grid. The original heaps are bound again
+      {
+        setCell();
+        vkCmdBindResourceHeapEXT(cmd, &resBind);
+        vkCmdBindSamplerHeapEXT(cmd, &sampBind);
+
+        setMarker(cmd, "Heap Array Layout: imgStride=" + std::to_string(imgStride) +
+                           " bufStride=" + std::to_string(bufStride) +
+                           " sampStride=" + std::to_string(sampStride) +
+                           " texArr=" + std::to_string(arrTexOffset) +
+                           " ssboArr=" + std::to_string(arrSsboOffset) +
+                           " ssboBase=" + std::to_string(arrSsboBase) +
+                           " samp=" + std::to_string(sampOffset));
+
+        // textures 0, 1 and 3, and element 1 of the buffer array
+        ArrayPushData push = {arrSsboBase, 0xb, 1};
+
+        VkPushDataInfoEXT pushInfo = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+        pushInfo.offset = 0;
+        pushInfo.data.address = &push;
+        pushInfo.data.size = sizeof(push);
+        vkCmdPushDataEXT(cmd, &pushInfo);
+
+        setMarker(cmd, "Heap Array Draw");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, arrayPipe);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
       }
 
       vkCmdEndRenderPass(cmd);

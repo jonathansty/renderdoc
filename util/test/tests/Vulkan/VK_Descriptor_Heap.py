@@ -48,6 +48,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_mapped_accesses()
 
+        self.check_mapped_array_accesses()
+
         self.check_direct_heap_access()
 
         self.check_heap_buffers()
@@ -659,6 +661,110 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             self.check_no_validation(f"Heap Test {test} mapped access")
 
             rdtest.log.success(f"Heap Test {test} reported the expected {len(got)} mapped accesses")
+
+    def check_mapped_array_accesses(self):
+        """Arrayed set/binding mappings are found by feedback, which reports the elements used. The draw reads
+        textures 0, 1 and 3 of a 4 element image array (constant offset with an array stride) and element 1 of an
+        SSBO array (push index base of 1 plus an array stride), so buffer 2 of the heap's array"""
+        layout_action = self.find_action("Heap Array Layout:")
+
+        if layout_action is None:
+            raise rdtest.TestFailureException("Couldn't find the heap array layout marker")
+
+        layout = {}
+        for item in layout_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        draw = self.find_action("Heap Array Draw")
+
+        if draw is None:
+            raise rdtest.TestFailureException("Couldn't find the heap array draw marker")
+
+        self.controller.GetDebugMessages()
+
+        self.set_event(draw.nextAction.eventId, False)
+
+        frag = rd.ShaderStage.Fragment
+        ssbo_types = (rd.DescriptorType.Buffer, rd.DescriptorType.ReadWriteBuffer)
+
+        pipe = self.controller.GetVulkanPipelineState()
+        heaps = {'res': pipe.resourceHeap.buffer, 'samp': pipe.samplerHeap.buffer}
+
+        refl = self.controller.GetPipelineState().GetShaderReflection(frag)
+
+        # (type, array element, heap, byte offset, resource name, reflection name)
+        expected = [
+            (rd.DescriptorType.Image, 0, 'res', layout['texArr'], 'arrTex0', 'texArr'),
+            (rd.DescriptorType.Image, 1, 'res', layout['texArr'] + layout['imgStride'], 'arrTex1', 'texArr'),
+            (rd.DescriptorType.Image, 3, 'res', layout['texArr'] + layout['imgStride'] * 3, 'arrTex3', 'texArr'),
+            (rd.DescriptorType.Sampler, 0, 'samp', layout['samp'], None, 'arrSamp'),
+            ('ssbo', 1, 'res', layout['ssboArr'] + layout['bufStride'] * (layout['ssboBase'] + 1), 'arrSsbo2',
+             'ssboArr'),
+        ]
+
+        got = []
+        for a in self.controller.GetDescriptorAccess():
+            if a.index == rd.DescriptorAccess.NoShaderBinding:
+                continue
+
+            # push constants (including the leftover compute pipeline's) are not heap mapped
+            if a.type == rd.DescriptorType.ConstantBuffer:
+                if not self.controller.GetPipelineState().GetShaderReflection(a.stage).constantBlocks[
+                        a.index].bufferBacked:
+                    continue
+                raise rdtest.TestFailureException(f"Unexpected constant buffer access {a.index}")
+
+            if a.stage != frag:
+                raise rdtest.TestFailureException(f"Unexpected stage {a.stage} for access")
+
+            if a.descriptorStore == rd.ResourceId():
+                raise rdtest.TestFailureException(f"Access {a.type} {a.index}[{a.arrayElement}] has no store")
+
+            heap = [k for k, v in heaps.items() if v == a.descriptorStore]
+            if len(heap) != 1:
+                raise rdtest.TestFailureException(
+                    f"Access {a.type} {a.index}[{a.arrayElement}] has unexpected store {a.descriptorStore}")
+
+            r = rd.DescriptorRange(a)
+
+            if a.type == rd.DescriptorType.Sampler:
+                res = None
+                name = refl.samplers[a.index].name
+                typ = a.type
+            else:
+                desc = self.controller.GetDescriptors(a.descriptorStore, [r])[0]
+                res = self.get_resource(desc.resource).name if desc.resource != rd.ResourceId() else None
+                typ = 'ssbo' if a.type in ssbo_types else a.type
+                name = refl.readOnlyResources[a.index].name if a.type != rd.DescriptorType.ReadWriteBuffer else \
+                    refl.readWriteResources[a.index].name
+
+            # the logical location names the heap slot
+            loc = self.controller.GetDescriptorLocations(a.descriptorStore, [r])[0]
+            exp_loc = f"{'SamplerHeap' if heap[0] == 'samp' else 'ResourceHeap'}[{a.byteOffset // a.byteSize}]"
+            if loc.logicalBindName != exp_loc:
+                raise rdtest.TestFailureException(f"Access location is {loc.logicalBindName}, expected {exp_loc}")
+
+            got.append((typ, a.arrayElement, heap[0], a.byteOffset, res, name))
+
+        if sorted(got, key=str) != sorted(expected, key=str):
+            raise rdtest.TestFailureException(
+                f"Mapped array accesses don't match. Got: {sorted(got, key=str)} Expected: {sorted(expected, key=str)}")
+
+        self.check_no_validation("mapped array access")
+
+        rdtest.log.success(f"Heap Array Draw reported the expected {len(got)} mapped accesses")
+
+        # tex0 + tex1 + tex3 + ssbo element: (0.5, 0, 0) + (0, 0.25, 0) + (0.25, 0.25, 0) + (0, 0, 0.5)
+        v = self.controller.GetPipelineState().GetViewport(0)
+        out = self.controller.GetPipelineState().GetOutputTargets()[0].resource
+
+        self.check_pixel_value(out, int(v.x + v.width * 0.5), int(v.y + v.height * 0.5), (0.75, 0.5, 0.5, 1.0),
+                               eps=0.02)
+
+        self.check_no_validation("mapped array draw")
+
+        rdtest.log.success("Heap Array Draw output is as expected")
 
     def check_heap_rebind(self):
         """Heap state changes within one command buffer: rebinding both heaps, only one of them,

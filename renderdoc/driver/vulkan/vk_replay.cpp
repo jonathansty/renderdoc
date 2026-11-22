@@ -3142,7 +3142,7 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
     // push data shares storage with push constants, but is only meaningful if it was pushed with
     // vkCmdPushDataEXT
     const HeapMappingResult res =
-        ResolveHeapMapping(shad.descriptorMappings, set, bind, typeMask, 0,
+        ResolveHeapMapping(shad.descriptorMappings, set, bind, typeMask, access.arrayElement,
                            state.pushDataHeap ? state.pushconsts : NULL, state.pushConstSize);
 
     const VulkanRenderState::DescriptorHeapBind *heap = NULL;
@@ -3331,6 +3331,31 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
     for(size_t i = first; i < ret.size(); i++)
     {
       DescriptorAccess &access = ret[i];
+
+      // arrayed set/binding mappings of heap pipelines: the element used is in arrayElement
+      if(access.descriptorStore == VulkanCreationInfo::heapMappedStorage)
+      {
+        const VulkanCreationInfo::ShaderEntry *shad = NULL;
+        const VulkanStatePipeline &pipe =
+            access.stage == ShaderStage::Compute ? state.compute : state.graphics;
+
+        if(pipe.shaderObject)
+        {
+          ResourceId so = state.shaderObjects[(uint32_t)access.stage];
+          if(so != ResourceId())
+            shad = &m_pDriver->m_CreationInfo.m_ShaderObject[so].shad;
+        }
+        else if(pipe.pipeline != ResourceId())
+        {
+          shad = &m_pDriver->m_CreationInfo.m_Pipeline[pipe.pipeline].shaders[(uint32_t)access.stage];
+        }
+
+        if(shad)
+          resolveHeapMapped(access, *shad);
+        else
+          access.descriptorStore = ResourceId();
+        continue;
+      }
 
       if(access.index != DescriptorAccess::NoShaderBinding)
         continue;

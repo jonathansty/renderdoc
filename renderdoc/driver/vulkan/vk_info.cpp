@@ -1197,7 +1197,7 @@ static void ProcessStaticHeapMappedDescriptorAccess(
   access.byteOffset = 0;
   access.byteSize = 1;
 
-  // arrayed descriptors will be handled with bindless feedback (TODO(heap 5.4))
+  // arrayed descriptors are handled with bindless feedback, which reports the elements used
   auto add = [&](DescriptorType type, uint16_t idx, uint32_t set, uint32_t bind,
                  VkSpirvResourceTypeFlagsEXT typeMask) {
     if(typeMask == 0)

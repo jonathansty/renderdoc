@@ -30,6 +30,7 @@
 #include "driver/shaders/spirv/spirv_op_helpers.h"
 #include "vk_core.h"
 #include "vk_debug.h"
+#include "vk_heap_mapping.h"
 #include "vk_replay.h"
 #include "vk_shader_cache.h"
 
@@ -2010,18 +2011,62 @@ bool VulkanReplay::FetchShaderFeedback(uint32_t eventId)
       }
     }
 
-    auto processBinding = [this, usesHeaps, &shaderObject, &descLayouts, &stageDescLayouts,
-                           &descBufs, &descSets, &feedbackData](
+    auto processBinding = [this, usesHeaps, &state, &shaderEntries, &shaderObject, &descLayouts,
+                           &stageDescLayouts, &descBufs, &descSets, &feedbackData](
                               ShaderStage stage, DescriptorType type, bool inputAttachment,
                               uint16_t index, uint32_t bindset, uint32_t bind, uint32_t arraySize) {
       // only process array bindings
       if(arraySize <= 1)
         return;
 
-      // heap pipelines have no descriptor set layouts to resolve array bindings against
-      // TODO(heap 2.3): arrays in set/binding mappings are not supported, only direct heap access
+      // heap pipelines have no descriptor set layouts, arrays in set/binding mappings are located
+      // by the mapping of the shader. The element used is recorded the same way as for descriptor
+      // sets, but the access is a placeholder (see VulkanCreationInfo::heapMappedStorage) which
+      // GetDescriptorAccess resolves for the element in arrayElement, against the heaps and push data
+      // bound at the event
       if(usesHeaps)
+      {
+        const VulkanCreationInfo::ShaderEntry *entry = shaderEntries[(uint32_t)stage];
+        if(!entry)
+          return;
+
+        // bindings with no mapping are not statically used
+        if(!FindHeapMapping(entry->descriptorMappings, bindset, bind,
+                            SpirvResourceTypeForDescriptor(type, inputAttachment)))
+          return;
+
+        BindKey key;
+        key.stage = stage;
+        key.index.category = CategoryForDescriptorType(type);
+        key.index.index = index;
+        key.index.arrayElement = 0;
+
+        // there's no layout to give the size of unbounded arrays, so allow as many descriptors as
+        // fit in the bound heap, within the same limit as direct heap access
+        const VulkanRenderState::DescriptorHeapBind &heap =
+            type == DescriptorType::Sampler ? state.samplerHeap : state.resourceHeap;
+        if(arraySize == ~0U)
+        {
+          const uint32_t descSize = m_pDriver->HeapDescriptorSize(MakeVkDescriptorType(type, false));
+          arraySize = (heap.valid && descSize) ? uint32_t(RDCMIN<uint64_t>(
+                                                     heap.size / descSize, MaxHeapFeedbackSlots))
+                                               : 1;
+        }
+        arraySize = RDCMIN(arraySize, MaxHeapFeedbackSlots);
+
+        DescriptorAccess access;
+        access.stage = stage;
+        access.type = type;
+        access.index = index;
+        access.descriptorStore = VulkanCreationInfo::heapMappedStorage;
+        access.byteOffset = 0;
+        access.byteSize = 1;
+
+        feedbackData.offsetMap[key] = {feedbackData.feedbackStorageSize, arraySize, access};
+
+        feedbackData.feedbackStorageSize += arraySize * sizeof(uint32_t);
         return;
+      }
 
       rdcarray<const DescSetLayout *> &descSetLayouts =
           shaderObject ? stageDescLayouts[(uint32_t)stage] : descLayouts;
