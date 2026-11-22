@@ -50,6 +50,11 @@ enum class PointerFlags
   GlobalArrayBinding = 0x4,
   DereferencedPhysical = 0x8,
   StructArrayBinding = 0x10,
+  // pointer into a descriptor heap (SPV_EXT_descriptor_heap). These have no inner variable, the
+  // byte offset in the heap is in the byte offset slot and the pointed-to type in the buffer type
+  // slot
+  DescriptorHeap = 0x20,
+  SamplerHeap = 0x40,
 };
 
 BITMASK_OPERATORS(PointerFlags);
@@ -463,12 +468,14 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       "SPV_KHR_subgroup_uniform_control_flow",
       "SPV_KHR_subgroup_vote",
       "SPV_KHR_terminate_invocation",
+      "SPV_KHR_untyped_pointers",
       "SPV_KHR_vulkan_memory_model",
       "SPV_KHR_compute_shader_derivatives",
       "SPV_KHR_integer_dot_product",
 
       // EXT extensions
       "SPV_EXT_demote_to_helper_invocation",
+      "SPV_EXT_descriptor_heap",
       "SPV_EXT_descriptor_indexing",
       "SPV_EXT_fragment_fully_covered",
       "SPV_EXT_fragment_invocation_density",
@@ -680,10 +687,12 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
         break;
       }
 
-      // SPV_KHR_untyped_pointers
+      // SPV_KHR_untyped_pointers / SPV_EXT_descriptor_heap: supported only for direct access to
+      // images and samplers in the descriptor heaps. Unsupported uses are checked below
       case Capability::UntypedPointersKHR:
+      case Capability::DescriptorHeapEXT:
       {
-        supported = false;
+        supported = true;
         break;
       }
 
@@ -766,13 +775,6 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
 
       // SPV_EXT_long_vector
       case Capability::LongVectorEXT:
-      {
-        supported = false;
-        break;
-      }
-
-      // SPV_EXT_descriptor_heap
-      case Capability::DescriptorHeapEXT:
       {
         supported = false;
         break;
@@ -958,6 +960,55 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
     }
   }
 
+  // untyped pointers are only supported for direct access to images and samplers in the descriptor
+  // heaps, so check for anything else
+  if(capabilities.find(Capability::UntypedPointersKHR) != capabilities.end() ||
+     capabilities.find(Capability::DescriptorHeapEXT) != capabilities.end())
+  {
+    std::set<Op> unsupportedOps;
+
+    for(ConstIter it(m_SPIRV, FirstRealWord); it; it++)
+    {
+      switch(it.opcode())
+      {
+        case Op::UntypedVariableKHR:
+        {
+          OpUntypedVariableKHR var(it);
+          const Decorations &dec = decorations[var.result];
+          if(var.storageClass != StorageClass::UniformConstant ||
+             (dec.flags & Decorations::HasBuiltIn) == 0 ||
+             (dec.builtIn != BuiltIn::ResourceHeapEXT && dec.builtIn != BuiltIn::SamplerHeapEXT))
+          {
+            debuggable = false;
+            debugStatus += StringFormat::Fmt(
+                "Unsupported untyped variable %u in %s storage (only descriptor heaps are "
+                "supported)\n",
+                var.result.value(), ToStr(var.storageClass).c_str());
+          }
+          break;
+        }
+        // buffers in descriptor heaps aren't supported yet
+        case Op::TypeBufferEXT:
+        case Op::BufferPointerEXT:
+        case Op::UntypedPtrAccessChainKHR:
+        case Op::UntypedInBoundsPtrAccessChainKHR:
+        case Op::UntypedArrayLengthKHR:
+        case Op::UntypedPrefetchKHR:
+        case Op::UntypedImageTexelPointerEXT:
+        case Op::UntypedGroupAsyncCopyKHR:
+        case Op::MemberDecorateIdEXT: unsupportedOps.insert(it.opcode()); break;
+        default: break;
+      }
+    }
+
+    for(Op op : unsupportedOps)
+    {
+      debuggable = false;
+      debugStatus +=
+          StringFormat::Fmt("Unsupported untyped pointer operation %s\n", ToStr(op).c_str());
+    }
+  }
+
   for(auto it = extSets.begin(); it != extSets.end(); it++)
   {
     Id id = it->first;
@@ -1119,6 +1170,32 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
     SetStructArrayNames(c.value, typeWalk, specInfo);
   }
 
+  // OpConstantSizeOfEXT is the implementation-defined size of a descriptor type, which we can only
+  // get from the API. Update the placeholder constants before evaluating anything that uses them
+  for(auto it = sizeOfConstants.begin(); it != sizeOfConstants.end(); ++it)
+  {
+    DescriptorType descType = GetHeapDescriptorType(it->second);
+    uint32_t size = 0;
+    if(descType != DescriptorType::Unknown)
+      size = apiWrapper->GetDescriptorHeapTypeSize(descType);
+
+    if(size == 0)
+      AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
+                      MessageSource::RuntimeWarning,
+                      StringFormat::Fmt("Couldn't determine the size of %s for OpConstantSizeOfEXT",
+                                        GetHumanName(it->second).c_str()));
+
+    auto constIt = constants.find(it->first);
+    if(constIt != constants.end())
+    {
+      ShaderVariable &v = constIt->second.value;
+      auto typeIt = dataTypes.find(constIt->second.type);
+      if(typeIt != dataTypes.end() && typeIt->second.type == DataType::ScalarType)
+        v.type = typeIt->second.scalar().Type();
+      v.value.u64v[0] = size;
+    }
+  }
+
   // evaluate all constants
   for(auto it = constants.begin(); it != constants.end(); it++)
   {
@@ -1129,6 +1206,28 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
 
     active.ids[it->first] = EvaluateConstant(it->first, specInfo);
     active.ids[it->first].name = GetRawName(it->first);
+  }
+
+  // evaluate the array strides given by ID, which are needed for descriptor heap access chains
+  for(auto it = arrayStrideIds.begin(); it != arrayStrideIds.end(); ++it)
+  {
+    if(constants.find(it->second) == constants.end())
+      continue;
+
+    ShaderVariable stride = EvaluateConstant(it->second, specInfo);
+    arrayStrides[it->first] =
+        VarTypeByteSize(stride.type) == 8 ? stride.value.u64v[0] : stride.value.u32v[0];
+  }
+
+  // the descriptor heaps are untyped pointers, which point at a byte offset in the heap
+  for(const rdcpair<Id, StorageClass> &v : untypedGlobals)
+  {
+    const Decorations &dec = decorations[v.first];
+    if((dec.flags & Decorations::HasBuiltIn) &&
+       (dec.builtIn == BuiltIn::ResourceHeapEXT || dec.builtIn == BuiltIn::SamplerHeapEXT))
+    {
+      active.ids[v.first] = MakeHeapPointer(v.first, dec.builtIn == BuiltIn::SamplerHeapEXT);
+    }
   }
 
   rdcarray<rdcstr> inputSigNames, outputSigNames;
@@ -3668,6 +3767,13 @@ DeviceOpResult Debugger::ReadFromPointer(const ShaderVariable &ptr, ShaderVariab
     return DeviceOpResult::Succeeded;
   }
 
+  // descriptor heap pointers read as the descriptor they point to
+  if(IsHeapPointer(ptr))
+  {
+    ret = ReadHeapPointer(ptr, getBufferTypeId(ptr));
+    return DeviceOpResult::Succeeded;
+  }
+
   // values for setting up pointer reads, either from a physical pointer or from an opaque pointer
   rdcspv::Id typeId;
   Decorations parentDecorations;
@@ -3919,7 +4025,7 @@ bool Debugger::IsOpaquePointer(const ShaderVariable &ptr) const
   if(ptr.type != VarType::GPUPointer)
     return false;
 
-  if(IsPhysicalPointer(ptr))
+  if(IsPhysicalPointer(ptr) || IsHeapPointer(ptr))
     return false;
 
   const ShaderVariable *inner = getPointer(ptr);
@@ -3941,6 +4047,191 @@ bool Debugger::IsPhysicalPointer(const ShaderVariable &ptr) const
   return false;
 }
 
+bool Debugger::IsHeapPointer(const ShaderVariable &ptr) const
+{
+  return ptr.type == VarType::GPUPointer && !isUndefPointer(ptr) &&
+         ptr.GetPointer().pointerTypeID == OpaquePointerTypeID &&
+         checkPointerFlags(ptr, PointerFlags::DescriptorHeap);
+}
+
+ShaderVariable Debugger::MakeHeapPointer(Id id, bool samplerHeap) const
+{
+  // heap pointers are opaque pointers with no inner variable, since there's no storage for the heap
+  // itself. The descriptors are fetched from the API when loaded.
+  ShaderVariable var = MakePointerVariable(id, NULL);
+  setPointerFlags(var, samplerHeap ? (PointerFlags::DescriptorHeap | PointerFlags::SamplerHeap)
+                                   : PointerFlags::DescriptorHeap);
+  setByteOffset(var, 0);
+  setBufferTypeId(var, Id());
+  return var;
+}
+
+DescriptorType Debugger::GetHeapDescriptorType(Id typeId) const
+{
+  auto bufIt = bufferTypes.find(typeId);
+  if(bufIt != bufferTypes.end())
+    return bufIt->second == StorageClass::Uniform ? DescriptorType::ConstantBuffer
+                                                  : DescriptorType::ReadWriteBuffer;
+
+  auto typeIt = dataTypes.find(typeId);
+  if(typeIt == dataTypes.end())
+    return DescriptorType::Unknown;
+
+  switch(typeIt->second.type)
+  {
+    case DataType::ImageType:
+    {
+      auto imgIt = imageTypes.find(typeId);
+      if(imgIt == imageTypes.end())
+        return DescriptorType::Unknown;
+
+      const bool texelBuffer = imgIt->second.dim == Dim::Buffer;
+      if(imgIt->second.sampled == 2 && imgIt->second.dim != Dim::SubpassData)
+        return texelBuffer ? DescriptorType::ReadWriteTypedBuffer : DescriptorType::ReadWriteImage;
+      return texelBuffer ? DescriptorType::TypedBuffer : DescriptorType::Image;
+    }
+    case DataType::SamplerType: return DescriptorType::Sampler;
+    case DataType::SampledImageType: return DescriptorType::ImageSampler;
+    case DataType::AccelerationStructureType: return DescriptorType::AccelerationStructure;
+    default: break;
+  }
+
+  return DescriptorType::Unknown;
+}
+
+bool Debugger::GetHeapArrayStride(Id arrayType, uint64_t &stride) const
+{
+  const Decorations &dec = decorations[arrayType];
+  if(dec.flags & Decorations::HasArrayStride)
+  {
+    stride = dec.arrayStride;
+    return true;
+  }
+
+  auto it = arrayStrides.find(arrayType);
+  if(it != arrayStrides.end())
+  {
+    stride = it->second;
+    return true;
+  }
+
+  return false;
+}
+
+ShaderVariable Debugger::MakeHeapAccessChain(const ShaderVariable &base, Id baseType,
+                                             const rdcarray<uint64_t> &indices) const
+{
+  ShaderVariable ret = base;
+
+  // walk the indices from the base type, accumulating the byte offset in the heap
+  uint64_t byteOffset = getByteOffset(base);
+  Id typeId = baseType;
+
+  for(size_t i = 0; i < indices.size(); i++)
+  {
+    auto typeIt = dataTypes.find(typeId);
+    const DataType::Type type =
+        typeIt == dataTypes.end() ? DataType::UnknownType : typeIt->second.type;
+
+    if(type == DataType::ArrayType)
+    {
+      uint64_t stride = 0;
+      if(!GetHeapArrayStride(typeId, stride))
+      {
+        AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt("No array stride found for %s in descriptor heap access chain",
+                              GetHumanName(typeId).c_str()));
+        break;
+      }
+
+      byteOffset += indices[i] * stride;
+      typeId = typeIt->second.InnerType();
+    }
+    else if(type == DataType::StructType)
+    {
+      const rdcarray<DataType::Child> &children = typeIt->second.children;
+      if(indices[i] >= children.size() ||
+         (children[(size_t)indices[i]].decorations.flags & Decorations::HasOffset) == 0)
+      {
+        AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt("Invalid member %llu of %s in descriptor heap access chain",
+                              indices[i], GetHumanName(typeId).c_str()));
+        break;
+      }
+
+      byteOffset += children[(size_t)indices[i]].decorations.offset;
+      typeId = children[(size_t)indices[i]].type;
+    }
+    else
+    {
+      AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
+                      MessageSource::RuntimeWarning,
+                      StringFormat::Fmt("Unsupported type %s in descriptor heap access chain",
+                                        GetHumanName(typeId).c_str()));
+      break;
+    }
+  }
+
+  setByteOffset(ret, byteOffset);
+  setBufferTypeId(ret, typeId);
+
+  return ret;
+}
+
+ShaderVariable Debugger::ReadHeapPointer(const ShaderVariable &ptr, Id typeId) const
+{
+  ShaderVariable ret;
+  ret.name = ptr.name;
+  ret.rows = ret.columns = 1;
+
+  const uint64_t byteOffset = getByteOffset(ptr);
+  const DescriptorType descType = GetHeapDescriptorType(typeId);
+
+  switch(descType)
+  {
+    case DescriptorType::Sampler:
+    {
+      ret.type = VarType::Sampler;
+      ret.SetDirectAccess(apiWrapper->GetDescriptorHeapAccess(descType, byteOffset));
+      break;
+    }
+    case DescriptorType::Image:
+    case DescriptorType::ReadWriteImage:
+    case DescriptorType::TypedBuffer:
+    case DescriptorType::ReadWriteTypedBuffer:
+    {
+      ret.type = (descType == DescriptorType::ReadWriteImage ||
+                  descType == DescriptorType::ReadWriteTypedBuffer)
+                     ? VarType::ReadWriteResource
+                     : VarType::ReadOnlyResource;
+      ret.SetDirectAccess(apiWrapper->GetDescriptorHeapAccess(descType, byteOffset));
+
+      // store the texture type like we do for bound images, see the global setup
+      const Image &img = imageTypes[typeId];
+
+      uint32_t texType = DebugAPIWrapper::Float_Texture;
+      if(img.dim == Dim::Buffer)
+        texType |= DebugAPIWrapper::Buffer_Texture;
+      if(img.retType.type == Op::TypeInt)
+        texType |=
+            img.retType.signedness ? DebugAPIWrapper::SInt_Texture : DebugAPIWrapper::UInt_Texture;
+      setTextureType(ret, (DebugAPIWrapper::TextureType)texType);
+      break;
+    }
+    default:
+    {
+      // anything else can't be loaded yet, display the byte offset in the heap
+      ret.type = VarType::ULong;
+      ret.value.u64v[0] = byteOffset;
+      break;
+    }
+  }
+
+  return ret;
+}
+
 bool Debugger::ArePointersAndEqual(const ShaderVariable &a, const ShaderVariable &b) const
 {
   // we can do a pointer comparison by checking the values, since we store all pointer-related
@@ -3960,6 +4251,15 @@ DeviceOpResult Debugger::WriteThroughPointer(ShaderVariable &ptr, const ShaderVa
   ShaderBindIndex bind;
   uint64_t byteOffset = 0;
   std::function<void(uint64_t offset, uint64_t size, const void *src)> pointerWriteCallback;
+
+  // descriptor heaps can't be written through from shaders
+  if(IsHeapPointer(ptr))
+  {
+    AddDebugMessage(
+        MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+        StringFormat::Fmt("Unsupported write through descriptor heap pointer %s", ptr.name.c_str()));
+    return DeviceOpResult::Succeeded;
+  }
 
   if(IsPhysicalPointer(ptr))
   {
@@ -4378,6 +4678,8 @@ void Debugger::PostParse()
   // global IDs never hit a death point
   for(const Variable &v : globals)
     idLiveRange[v.id].second = ~0U;
+  for(const rdcpair<Id, StorageClass> &v : untypedGlobals)
+    idLiveRange[v.first].second = ~0U;
 
   if(m_DebugInfo.valid)
   {
@@ -4441,6 +4743,29 @@ void Debugger::RegisterOp(Iter it)
   Processor::RegisterOp(it);
 
   OpDecoder opdata(it);
+
+  // track declarations used by direct descriptor heap access (SPV_EXT_descriptor_heap)
+  if(opdata.op == Op::UntypedVariableKHR && curFunction == NULL)
+  {
+    OpUntypedVariableKHR decoded(it);
+    untypedGlobals.push_back({decoded.result, decoded.storageClass});
+  }
+  else if(opdata.op == Op::ConstantSizeOfEXT)
+  {
+    OpConstantSizeOfEXT decoded(it);
+    sizeOfConstants[decoded.result] = decoded.type;
+  }
+  else if(opdata.op == Op::TypeBufferEXT)
+  {
+    OpTypeBufferEXT decoded(it);
+    bufferTypes[decoded.result] = decoded.storageClass;
+  }
+  else if(opdata.op == Op::DecorateId)
+  {
+    OpDecorateId decoded(it);
+    if(decoded.decoration == Decoration::ArrayStrideIdEXT)
+      arrayStrideIds[decoded.target] = decoded.decoration.arrayStrideIdEXT;
+  }
 
   // we add +1 so that we don't remove the ID on its last use, but the next subsequent instruction
   // since blocks always end with a terminator that doesn't consume IDs we're interested in

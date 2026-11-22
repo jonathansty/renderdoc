@@ -251,6 +251,36 @@ public:
         }
       }
     }
+    // cache the bound descriptor heaps for direct heap access (SPV_EXT_descriptor_heap). Heap
+    // descriptors are resolved on demand by offset, rather than relying on the accesses from
+    // feedback above which are only at a coarse granularity
+    if(m_pDriver->DescriptorHeaps())
+    {
+      const VulkanRenderState &state = m_pDriver->GetRenderState();
+
+      if(state.resourceHeap.valid)
+        m_pDriver->GetResIDFromAddr(state.resourceHeap.address, m_ResourceHeap.store,
+                                    m_ResourceHeap.offset);
+      if(state.samplerHeap.valid)
+        m_pDriver->GetResIDFromAddr(state.samplerHeap.address, m_SamplerHeap.store,
+                                    m_SamplerHeap.offset);
+
+      const DescriptorType heapTypes[] = {
+          DescriptorType::ConstantBuffer,  DescriptorType::Sampler,
+          DescriptorType::Image,           DescriptorType::TypedBuffer,
+          DescriptorType::ReadWriteImage,  DescriptorType::ReadWriteTypedBuffer,
+          DescriptorType::ReadWriteBuffer,
+      };
+
+      for(DescriptorType type : heapTypes)
+        m_HeapDescriptorSizes[uint32_t(type)] =
+            m_pDriver->HeapDescriptorSize(MakeVkDescriptorType(type, false));
+
+      // combined image samplers in the heap are just images
+      m_HeapDescriptorSizes[uint32_t(DescriptorType::ImageSampler)] =
+          m_HeapDescriptorSizes[uint32_t(DescriptorType::Image)];
+    }
+
     RDCASSERT(ShaderDebugData::MAX_QUEUED_OPS * mathOpResultByteSize <
               m_DebugData.ReadbackBuffer.TotalSize());
     RDCASSERT(sampleGatherOpResultsStart +
@@ -295,6 +325,27 @@ public:
   virtual bool SimulateThreaded() override { return Vulkan_Debug_EnableShaderDebugMT(); }
 
   virtual ResourceId GetShaderID() override { return m_ShaderID; }
+
+  virtual uint32_t GetDescriptorHeapTypeSize(DescriptorType type) override
+  {
+    if(uint32_t(type) >= ARRAY_COUNT(m_HeapDescriptorSizes))
+      return 0;
+    return m_HeapDescriptorSizes[uint32_t(type)];
+  }
+
+  virtual ShaderDirectAccess GetDescriptorHeapAccess(DescriptorType type,
+                                                     uint64_t heapByteOffset) override
+  {
+    // samplers can only be in the sampler heap, everything else is in the resource heap
+    const HeapBind &heap = type == DescriptorType::Sampler ? m_SamplerHeap : m_ResourceHeap;
+
+    if(heap.store == ResourceId())
+      return ShaderDirectAccess();
+
+    // this matches the direct heap accesses returned from GetDescriptorAccess
+    return ShaderDirectAccess(type, heap.store, uint32_t(heap.offset + heapByteOffset),
+                              GetDescriptorHeapTypeSize(type));
+  }
 
   virtual uint64_t GetBufferLength(const ShaderBindIndex &bind) override
   {
@@ -1855,6 +1906,59 @@ private:
   rdcarray<Descriptor> m_Descriptors;
   rdcarray<SamplerDescriptor> m_SamplerDescriptors;
 
+  // descriptor heaps bound at this event, the buffer and the offset of the heap within it
+  struct HeapBind
+  {
+    ResourceId store;
+    uint64_t offset = 0;
+  } m_ResourceHeap, m_SamplerHeap;
+
+  // sizes of descriptors in the heaps, indexed by DescriptorType
+  uint32_t m_HeapDescriptorSizes[uint32_t(DescriptorType::AccelerationStructure) + 1] = {};
+
+  // descriptors looked up from the heaps on demand, by the direct heap binding from the debugger
+  std::map<ShaderBindIndex, Descriptor> m_HeapDescriptors;
+  std::map<ShaderBindIndex, SamplerDescriptor> m_HeapSamplerDescriptors;
+
+  // looks up a direct heap descriptor binding from the debugger, see rdcspv::IsDirectHeapBind.
+  // The byte offset is relative to the heap buffer, like the direct accesses from feedback
+  bool FetchHeapDescriptor(const rdcstr &access, const ShaderBindIndex &index)
+  {
+    CHECK_DEVICE_THREAD();
+
+    if(m_HeapDescriptors.find(index) != m_HeapDescriptors.end())
+      return true;
+
+    const DescriptorType type = rdcspv::GetDirectHeapBindType(index);
+    const HeapBind &heap = type == DescriptorType::Sampler ? m_SamplerHeap : m_ResourceHeap;
+
+    if(heap.store == ResourceId())
+    {
+      m_pDriver->AddDebugMessage(
+          MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("No %s heap bound for direct heap access at byte offset %u when %s.",
+                            type == DescriptorType::Sampler ? "sampler" : "resource",
+                            index.arrayElement, access.c_str()));
+      return false;
+    }
+
+    VulkanReplay *replay = m_pDriver->GetReplay();
+
+    DescriptorRange range;
+    range.offset = index.arrayElement;
+    range.descriptorSize = GetDescriptorHeapTypeSize(type);
+    range.count = 1;
+    range.type = type;
+
+    rdcarray<Descriptor> descs = replay->GetDescriptors(heap.store, {range});
+    rdcarray<SamplerDescriptor> samps = replay->GetSamplerDescriptors(heap.store, {range});
+
+    m_HeapDescriptors[index] = descs.empty() ? Descriptor() : descs[0];
+    m_HeapSamplerDescriptors[index] = samps.empty() ? SamplerDescriptor() : samps[0];
+
+    return true;
+  }
+
   std::map<ResourceId, VkImageView> m_SampleViews;
   struct BufViewKey
   {
@@ -1930,6 +2034,16 @@ private:
       return dummy;
     }
 
+    if(rdcspv::IsDirectHeapBind(index))
+    {
+      if(!FetchHeapDescriptor(access, index))
+      {
+        valid = false;
+        return dummy;
+      }
+      return m_HeapDescriptors[index];
+    }
+
     int32_t a = m_Access.indexOf(index);
 
     // this should not happen unless the debugging references an array element that we didn't
@@ -1960,6 +2074,16 @@ private:
     {
       // invalid index, return a dummy data but don't mark as invalid
       return dummy;
+    }
+
+    if(rdcspv::IsDirectHeapBind(index))
+    {
+      if(!FetchHeapDescriptor(access, index))
+      {
+        valid = false;
+        return dummy;
+      }
+      return m_HeapSamplerDescriptors[index];
     }
 
     int32_t a = m_Access.indexOf(index);
@@ -6730,9 +6854,10 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   // get ourselves in pristine state before this dispatch (without any side effects it may have had)
   m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
 
-  if(state.UsesDescriptorHeaps(m_pDriver, stage == ShaderStage::Compute))
+  // compute shaders using descriptor heaps can be debugged, task/mesh shaders not yet
+  if(stage != ShaderStage::Compute && state.UsesDescriptorHeaps(m_pDriver, false))
   {
-    // TODO(heap slice 2): descriptors are not resolvable for descriptor heap shaders yet
+    // TODO(heap slice 3.2): task/mesh shader debugging with descriptor heaps
     RDCWARN("%s debugging is not supported with descriptor heaps", ToStr(stage).c_str());
     return new ShaderDebugTrace();
   }

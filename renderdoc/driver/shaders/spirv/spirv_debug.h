@@ -103,6 +103,38 @@ inline int32_t AtomicLoad(const int32_t *var)
 
 struct ThreadState;
 
+// direct descriptor heap accesses (SPV_EXT_descriptor_heap) have no shader binding. Values loaded
+// from a heap are ShaderDirectAccess variables referring to the descriptor in the heap buffer, and
+// to pass them to the API wrapper they are converted to a ShaderBindIndex with the index set to
+// DirectHeapBindIndex | DescriptorType and the arrayElement set to the byte offset of the
+// descriptor in its descriptor store. The heap is implied by the category: samplers can only be in
+// the sampler heap, everything else is in the resource heap.
+static const uint32_t DirectHeapBindIndex = 0xFFFF0000U;
+
+inline bool IsDirectHeapBind(const ShaderBindIndex &bind)
+{
+  return bind.category != DescriptorCategory::Unknown &&
+         (bind.index & 0xFFFF0000U) == DirectHeapBindIndex;
+}
+
+inline DescriptorType GetDirectHeapBindType(const ShaderBindIndex &bind)
+{
+  return DescriptorType(bind.index & 0xFFFFU);
+}
+
+// get the binding to pass to the API wrapper for a resource/sampler variable, whether it refers to
+// a normal binding or directly to a descriptor in a descriptor heap
+inline ShaderBindIndex GetResourceBindIndex(const ShaderVariable &var)
+{
+  if(var.IsDirectAccess())
+  {
+    ShaderDirectAccess access = var.GetDirectAccess();
+    return ShaderBindIndex(CategoryForDescriptorType(access.type),
+                           DirectHeapBindIndex | uint32_t(access.type), access.byteOffset);
+  }
+  return var.GetBindIndex();
+}
+
 class DebugAPIWrapper
 {
 public:
@@ -161,6 +193,17 @@ public:
   virtual bool GetQueuedResults(rdcarray<ShaderVariable *> &mathOpResults,
                                 rdcarray<ShaderVariable *> &sampleGatherResults) = 0;
   virtual bool QueuedOpsHasSpace() = 0;
+
+  // SPV_EXT_descriptor_heap: the size in bytes of a descriptor of the given type in a descriptor
+  // heap, used to evaluate OpConstantSizeOfEXT. Returns 0 if descriptor heaps aren't supported.
+  virtual uint32_t GetDescriptorHeapTypeSize(DescriptorType type) { return 0; }
+  // SPV_EXT_descriptor_heap: the direct access referring to the descriptor of the given type at a
+  // byte offset in the bound sampler heap (for samplers) or resource heap (for everything else).
+  // Must be callable from any thread.
+  virtual ShaderDirectAccess GetDescriptorHeapAccess(DescriptorType type, uint64_t heapByteOffset)
+  {
+    return ShaderDirectAccess();
+  }
 };
 
 // things we need to readback once per hit thread
@@ -735,6 +778,13 @@ public:
   bool IsOpaquePointer(const ShaderVariable &v) const;
   bool IsPhysicalPointer(const ShaderVariable &v) const;
 
+  // pointers into the descriptor heaps (SPV_EXT_descriptor_heap)
+  bool IsHeapPointer(const ShaderVariable &v) const;
+  ShaderVariable MakeHeapAccessChain(const ShaderVariable &base, Id baseType,
+                                     const rdcarray<uint64_t> &indices) const;
+  ShaderVariable ReadHeapPointer(const ShaderVariable &ptr, Id typeId) const;
+  DescriptorType GetHeapDescriptorType(Id typeId) const;
+
   bool ArePointersAndEqual(const ShaderVariable &a, const ShaderVariable &b) const;
   DeviceOpResult WriteThroughPointer(ShaderVariable &ptr, const ShaderVariable &val) const;
   ShaderVariable MakeCompositePointer(const ShaderVariable &base, Id id,
@@ -826,6 +876,19 @@ private:
 
   SparseIdMap<uint16_t> idToPointerType;
   rdcarray<rdcspv::Id> pointerTypeToId;
+
+  // SPV_EXT_descriptor_heap support. Untyped variables declared at global scope, with their
+  // storage class (only the descriptor heap builtins are supported), the types that
+  // OpConstantSizeOfEXT constants take the size of, and OpTypeBufferEXT types
+  rdcarray<rdcpair<Id, StorageClass>> untypedGlobals;
+  SparseIdMap<Id> sizeOfConstants;
+  SparseIdMap<StorageClass> bufferTypes;
+  // ArrayStrideIdEXT decorations, the ID of the stride constant and its evaluated value
+  SparseIdMap<Id> arrayStrideIds;
+  SparseIdMap<uint64_t> arrayStrides;
+
+  ShaderVariable MakeHeapPointer(Id id, bool samplerHeap) const;
+  bool GetHeapArrayStride(Id arrayType, uint64_t &stride) const;
 
   // the live mutable global variables, to initialise a stack frame's live list
   rdcarray<Id> liveGlobals;

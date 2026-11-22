@@ -1250,10 +1250,13 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   shad.refl = reflData.refl;
   shad.patchData = &reflData.patchData;
 
-  // heap shader objects have no set layouts or push constants, their static descriptor access is
-  // not described by layouts so leave it empty
+  // heap shader objects have no set layouts, so their only static descriptor access is to push
+  // constants (push data) and specialisation constants
   if(descriptorHeap)
+  {
+    ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, {});
     return;
+  }
 
   rdcarray<const DescSetLayout *> setLayoutInfos;
   for(ResourceId setLayout : descSetLayouts)
@@ -1991,10 +1994,13 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
   // flags have been merged from any linked libraries
   descriptorHeap = (flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT) != 0;
 
-  // heap pipelines have no pipeline layout at all, so no set layouts and no static descriptor access
+  // heap pipelines have no pipeline layout at all, so no set layouts. The only static descriptor
+  // access is to push constants (push data) and specialisation constants
   if(descriptorHeap)
   {
     descSetLayouts.clear();
+    for(const ShaderEntry &shad : shaders)
+      ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, {});
     return;
   }
 
@@ -2196,9 +2202,14 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
   logicOpEnable = false;
   logicOp = VK_LOGIC_OP_NO_OP;
 
-  // static descriptor access for heap pipelines is not described by layouts
+  // heap pipelines have no set layouts, so their only static descriptor access is to push
+  // constants (push data) and specialisation constants
   if(descriptorHeap)
+  {
+    for(const ShaderEntry &shad : shaders)
+      ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, {});
     return;
+  }
 
   rdcarray<const DescSetLayout *> setLayoutInfos;
   for(ResourceId setLayout : descSetLayouts)

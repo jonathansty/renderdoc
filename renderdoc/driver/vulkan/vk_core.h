@@ -511,7 +511,6 @@ private:
   Threading::CriticalSection m_HeapDescriptorLock;
   rdcarray<VkDescriptorType> m_NULLHeapDescriptorPatternsSaved;
   std::unordered_set<uint64_t> m_HeapSamplerHashes;
-  uint32_t HeapDescriptorSize(VkDescriptorType type);
 
   // replay only: heap descriptors have no view/sampler objects of their own, so we create real
   // (internal, not listed as resources) ones for each unique create info so that descriptors can be
@@ -1576,6 +1575,8 @@ public:
   bool Maintenance9() const { return m_Maintenance9; }
   bool DescriptorBuffers() const { return m_DescriptorBuffers; }
   bool DescriptorHeaps() const { return m_DescriptorHeaps; }
+  // size of a descriptor of the given type in a descriptor heap (VK_EXT_descriptor_heap)
+  uint32_t HeapDescriptorSize(VkDescriptorType type);
   bool DescriptorsInMemory() const { return m_DescriptorBuffers || m_DescriptorHeaps; }
   bool MultiViewGeometryShaders() const { return m_MultiViewGeometryShaders; }
   bool MultiviewPerViewViewports() const { return m_MultiviewPerViewViewports; }

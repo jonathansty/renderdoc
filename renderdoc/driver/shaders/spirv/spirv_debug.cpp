@@ -975,6 +975,24 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       // ignore
       (void)load.memoryAccess;
 
+      // loads from descriptor heaps fetch the descriptor of the loaded type
+      if(debugger.IsHeapPointer(GetSrc(load.pointer)))
+      {
+        const DescriptorType descType = debugger.GetHeapDescriptorType(load.resultType);
+        if(descType != DescriptorType::Image && descType != DescriptorType::ReadWriteImage &&
+           descType != DescriptorType::TypedBuffer &&
+           descType != DescriptorType::ReadWriteTypedBuffer && descType != DescriptorType::Sampler)
+        {
+          debugger.AddDebugMessage(
+              MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+              StringFormat::Fmt("Loading %s from a descriptor heap is not supported",
+                                debugger.GetHumanName(load.resultType).c_str()));
+        }
+
+        SetDst(load.result, debugger.ReadHeapPointer(GetSrc(load.pointer), load.resultType));
+        break;
+      }
+
       // get the pointer value, evaluate it (i.e. dereference) and store the result
       ShaderVariable val;
       if(ReadPointerValue(false, load.pointer, val) == DeviceOpResult::NeedsDevice)
@@ -1051,6 +1069,42 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
           gsmPointers[chain.result] = gsmGlobal;
         }
       }
+      break;
+    }
+    case Op::UntypedAccessChainKHR:
+    case Op::UntypedInBoundsAccessChainKHR:
+    {
+      // both opcodes have identical encodings
+      OpUntypedAccessChainKHR chain(it);
+
+      const ShaderVariable &base = GetSrc(chain.base);
+
+      // only descriptor heap access chains are supported, other untyped variables are rejected as
+      // not debuggable
+      if(!debugger.IsHeapPointer(base))
+      {
+        debugger.AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning,
+                                 StringFormat::Fmt("Unsupported untyped access chain on %s",
+                                                   debugger.GetHumanName(chain.base).c_str()));
+        SetDst(chain.result, base);
+        break;
+      }
+
+      rdcarray<uint64_t> indices;
+      indices.reserve(chain.indexes.size());
+      for(Id id : chain.indexes)
+      {
+        const ShaderVariable &idx = GetSrc(id);
+        if(VarTypeByteSize(idx.type) == 8)
+          indices.push_back(idx.value.u64v[0]);
+        else if(idx.type == VarType::SInt || idx.type == VarType::SShort || idx.type == VarType::SByte)
+          indices.push_back(uint64_t(int64_t(intComp(idx, 0))));
+        else
+          indices.push_back(uintComp(idx, 0));
+      }
+
+      SetDst(chain.result, debugger.MakeHeapAccessChain(base, chain.baseType, indices));
       break;
     }
     case Op::PtrAccessChain:
@@ -3973,10 +4027,10 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 
       ShaderBindIndex samplerIndex;
       if(sampler.type == VarType::Sampler || sampler.type == VarType::ReadOnlyResource)
-        samplerIndex = sampler.GetBindIndex();
+        samplerIndex = GetResourceBindIndex(sampler);
 
-      QueueSampleGather(opdata.op, texType, img.GetBindIndex(), samplerIndex, uv, ddxCalc, ddyCalc,
-                        compare, gather, operands, result);
+      QueueSampleGather(opdata.op, texType, GetResourceBindIndex(img), samplerIndex, uv, ddxCalc,
+                        ddyCalc, compare, gather, operands, result);
 
       result.rows = 1;
       result.columns = RDCMAX(1U, resultType.vector().count) & 0xff;
@@ -4023,14 +4077,14 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         // do it with samplegather as ImageFetch rather than a Read which caches the whole texture
         // on the CPU for no reason (since we can't write to it)
 
-        QueueSampleGather(Op::ImageFetch, texType, img.GetBindIndex(), ShaderBindIndex(), coord,
-                          ShaderVariable(), ShaderVariable(), ShaderVariable(), GatherChannel::Red,
-                          read.imageOperands, result);
+        QueueSampleGather(Op::ImageFetch, texType, GetResourceBindIndex(img), ShaderBindIndex(),
+                          coord, ShaderVariable(), ShaderVariable(), ShaderVariable(),
+                          GatherChannel::Red, read.imageOperands, result);
       }
       else
       {
         DeviceOpResult opResult =
-            debugger.ReadTexel(img.GetBindIndex(), coord,
+            debugger.ReadTexel(GetResourceBindIndex(img), coord,
                                read.imageOperands.flags & ImageOperands::Sample
                                    ? uintComp(GetSrc(read.imageOperands.sample), 0)
                                    : 0,
@@ -4061,7 +4115,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       // only the sample operand should be here
       RDCASSERT((write.imageOperands.flags & ImageOperands::Sample) == write.imageOperands.flags);
 
-      if(debugger.WriteTexel(img.GetBindIndex(), coord,
+      if(debugger.WriteTexel(GetResourceBindIndex(img), coord,
                              write.imageOperands.flags & ImageOperands::Sample
                                  ? uintComp(GetSrc(write.imageOperands.sample), 0)
                                  : 0,
@@ -4433,8 +4487,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        DeviceOpResult opResult = debugger.ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
-                                                     uintComp(ptr.members[2], 0), result);
+        DeviceOpResult opResult =
+            debugger.ReadTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
+                               uintComp(ptr.members[2], 0), result);
         if(opResult == DeviceOpResult::Failed)
         {
           // sample failed. Pretend we got 0 columns back
@@ -4473,7 +4528,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       }
       else
       {
-        if(debugger.WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
+        if(debugger.WriteTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
                                uintComp(ptr.members[2], 0), value) == DeviceOpResult::NeedsDevice)
         {
           SetStepNeedsDeviceThread();
@@ -4517,8 +4572,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        DeviceOpResult opResult = debugger.ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
-                                                     uintComp(ptr.members[2], 0), result);
+        DeviceOpResult opResult =
+            debugger.ReadTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
+                               uintComp(ptr.members[2], 0), result);
         if(opResult == DeviceOpResult::NeedsDevice)
         {
           SetStepNeedsDeviceThread();
@@ -4532,7 +4588,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
             RDCEraseEl(result.value);
           }
 
-          if(debugger.WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
+          if(debugger.WriteTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
                                  uintComp(ptr.members[2], 0), value) == DeviceOpResult::NeedsDevice)
           {
             SetStepNeedsDeviceThread();
@@ -4575,8 +4631,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        DeviceOpResult opResult = debugger.ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
-                                                     uintComp(ptr.members[2], 0), result);
+        DeviceOpResult opResult =
+            debugger.ReadTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
+                               uintComp(ptr.members[2], 0), result);
         if(opResult == DeviceOpResult::Failed)
         {
           // sample failed. Pretend we got 0 columns back
@@ -4616,8 +4673,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         }
         else
         {
-          DeviceOpResult opResult = debugger.WriteTexel(
-              ptr.members[0].GetBindIndex(), ptr.members[1], uintComp(ptr.members[2], 0), value);
+          DeviceOpResult opResult =
+              debugger.WriteTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
+                                  uintComp(ptr.members[2], 0), value);
           if(opResult == DeviceOpResult::NeedsDevice)
           {
             SetStepNeedsDeviceThread();
@@ -4657,8 +4715,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        DeviceOpResult opResult = debugger.ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
-                                                     uintComp(ptr.members[2], 0), result);
+        DeviceOpResult opResult =
+            debugger.ReadTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
+                               uintComp(ptr.members[2], 0), result);
         if(opResult == DeviceOpResult::Failed)
         {
           // sample failed. Pretend we got 0 columns back
@@ -4695,7 +4754,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       }
       else
       {
-        if(debugger.WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
+        if(debugger.WriteTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
                                uintComp(ptr.members[2], 0), result) == DeviceOpResult::NeedsDevice)
         {
           SetStepNeedsDeviceThread();
@@ -4745,8 +4804,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        DeviceOpResult opResult = debugger.ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
-                                                     uintComp(ptr.members[2], 0), result);
+        DeviceOpResult opResult =
+            debugger.ReadTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
+                               uintComp(ptr.members[2], 0), result);
         if(opResult == DeviceOpResult::Failed)
         {
           // sample failed. Pretend we got 0 columns back
@@ -4854,7 +4914,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       }
       else
       {
-        if(debugger.WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
+        if(debugger.WriteTexel(GetResourceBindIndex(ptr.members[0]), ptr.members[1],
                                uintComp(ptr.members[2], 0), result) == DeviceOpResult::NeedsDevice)
         {
           SetStepNeedsDeviceThread();
@@ -5412,8 +5472,6 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::IsNodePayloadValidAMDX:
     case Op::UntypedGroupAsyncCopyKHR:
     case Op::UntypedVariableKHR:
-    case Op::UntypedAccessChainKHR:
-    case Op::UntypedInBoundsAccessChainKHR:
     case Op::UntypedInBoundsPtrAccessChainKHR:
     case Op::UntypedPtrAccessChainKHR:
     case Op::UntypedArrayLengthKHR:
