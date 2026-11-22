@@ -52,6 +52,10 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_heap_mesh_output()
 
+        self.check_heap_overlays()
+
+        self.check_heap_pixel_history()
+
         eid = 0
 
         for test, checks in enumerate(expected):
@@ -125,6 +129,138 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             self.controller.FreeTrace(trace)
 
             rdtest.log.end_section(f"Heap Test {test}")
+
+    def heap_draws(self):
+        """The heap graphics draws used by the overlay and pixel history checks, as (marker, action)"""
+        draws = []
+        for marker in ("Heap Test 0", "Direct Heap Draw", "Heap Buffer Draw"):
+            action = self.find_action(marker)
+            if action is None:
+                raise rdtest.TestFailureException(f"Couldn't find marker {marker}")
+            draws.append((marker, action.nextAction))
+        return draws
+
+    def check_heap_overlays(self):
+        """Every debug overlay applicable to a draw, on draws using descriptor heaps"""
+        out = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
+
+        for marker, draw in self.heap_draws():
+            rdtest.log.begin_section(f"{marker} overlays")
+
+            self.controller.GetDebugMessages()
+            self.set_event(draw.eventId, True)
+
+            pipe = self.controller.GetPipelineState()
+            v = pipe.GetViewport(0)
+            col_tex = pipe.GetOutputTargets()[0].resource
+
+            # a point inside the draw (the middle of the viewport cell). The buffer draw is a triangle
+            cx = int(v.x + v.width * 0.5)
+            cy = int(v.y + v.height * (0.633 if marker == "Heap Buffer Draw" else 0.5))
+
+            tex = rd.TextureDisplay()
+            tex.resourceId = col_tex
+
+            for overlay in rd.DebugOverlay:
+                if overlay == rd.DebugOverlay.NoOverlay:
+                    continue
+
+                # These overlays are just displaymodes really, not actually separate overlays
+                if overlay == rd.DebugOverlay.NaN or overlay == rd.DebugOverlay.Clipping:
+                    continue
+
+                tex.overlay = overlay
+                out.SetTextureDisplay(tex)
+                out.Display()
+
+                overlay_id = out.GetDebugOverlayTexID()
+
+                picked = list(self.pick_pixel(overlay_id, cx, cy, rd.Subresource(), rd.CompType.Typeless).floatValue)
+
+                rdtest.log.print(f"{marker}: overlay {overlay!s} centre pixel {picked}")
+
+                eps = 1.0 / 256.0
+
+                if overlay == rd.DebugOverlay.Drawcall:
+                    # draw pixels are highlighted
+                    self.check_pixel_value(overlay_id, cx, cy, [0.8, 0.1, 0.8, 1.0], eps=eps)
+                elif overlay == rd.DebugOverlay.Wireframe:
+                    # wireframe only covers the edges: a row through the draw must cross some wireframe
+                    # pixels but not be filled with them
+                    hits = 0
+                    for px in range(int(v.x), int(v.x + v.width)):
+                        p = self.pick_pixel(overlay_id, px, cy, rd.Subresource(), rd.CompType.Typeless)
+                        if p.floatValue[3] != 0.0:
+                            hits += 1
+                    if hits == 0 or hits > v.width // 4:
+                        raise rdtest.TestFailureException(
+                            f"{marker}: wireframe overlay has {hits} wireframe pixels along the row")
+                elif overlay in (rd.DebugOverlay.Depth, rd.DebugOverlay.BackfaceCull):
+                    # no depth test and nothing is culled, so the draw passes everywhere it draws
+                    self.check_pixel_value(overlay_id, cx, cy, [0.0, 1.0, 0.0, 1.0], eps=eps)
+                elif overlay == rd.DebugOverlay.ViewportScissor:
+                    if picked[3] == 0.0:
+                        raise rdtest.TestFailureException(f"{marker}: viewport overlay is blank inside the viewport")
+                elif overlay in (rd.DebugOverlay.QuadOverdrawDraw, rd.DebugOverlay.QuadOverdrawPass):
+                    # refused for heap pipelines (TODO(heap slice 4)): the overlay is left blank rather than crashing
+                    if picked != [0.0, 0.0, 0.0, 0.0]:
+                        raise rdtest.TestFailureException(
+                            f"{marker}: quad overdraw should be blank with descriptor heaps, got {picked}")
+                elif overlay in (rd.DebugOverlay.TriangleSizeDraw, rd.DebugOverlay.TriangleSizePass):
+                    if picked[3] == 0.0:
+                        raise rdtest.TestFailureException(f"{marker}: triangle size overlay is blank inside the draw")
+
+                self.check_no_validation(f"{marker} overlay {overlay!s}")
+
+            rdtest.log.end_section(f"{marker} overlays")
+
+        out.Shutdown()
+
+    def check_heap_pixel_history(self):
+        """Pixel history on draws using descriptor heaps"""
+        for marker, draw in self.heap_draws():
+            rdtest.log.begin_section(f"{marker} pixel history")
+
+            self.controller.GetDebugMessages()
+            self.set_event(draw.eventId, True)
+
+            pipe = self.controller.GetPipelineState()
+            v = pipe.GetViewport(0)
+            col_tex = pipe.GetOutputTargets()[0].resource
+
+            x = int(v.x + v.width * 0.5)
+            y = int(v.y + v.height * (0.633 if marker == "Heap Buffer Draw" else 0.5))
+
+            picked = list(self.pick_pixel(col_tex, x, y, rd.Subresource(), rd.CompType.Typeless).floatValue)
+
+            history = self.controller.PixelHistory(col_tex, x, y, rd.Subresource(), rd.CompType.Typeless)
+
+            mods = [m for m in history if m.eventId == draw.eventId]
+            if len(mods) == 0:
+                raise rdtest.TestFailureException(
+                    f"{marker}: pixel history at {x},{y} has no modification for event {draw.eventId}: "
+                    f"{[m.eventId for m in history]}")
+
+            for m in mods:
+                if not m.Passed():
+                    raise rdtest.TestFailureException(f"{marker}: modification {m.eventId} did not pass")
+
+            m = mods[-1]
+
+            shader_out = list(m.shaderOut.col.floatValue)
+            post = list(m.postMod.col.floatValue)
+
+            rdtest.log.print(f"{marker}: picked {picked} shaderOut {shader_out} postMod {post}")
+
+            if not rdtest.value_compare(post, picked, eps=0.01):
+                raise rdtest.TestFailureException(f"{marker}: postMod {post} doesn't match pixel {picked}")
+
+            if not rdtest.value_compare(shader_out, picked, eps=0.01):
+                raise rdtest.TestFailureException(f"{marker}: shaderOut {shader_out} doesn't match pixel {picked}")
+
+            self.check_no_validation(f"{marker} pixel history")
+
+            rdtest.log.end_section(f"{marker} pixel history")
 
     def check_heap_mesh_output(self):
         """The mesh viewer's VS Out data for graphics pipelines that use descriptor heaps"""
