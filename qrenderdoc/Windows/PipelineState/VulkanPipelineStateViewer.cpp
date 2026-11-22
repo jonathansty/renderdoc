@@ -1876,7 +1876,8 @@ void VulkanPipelineStateViewer::setShaderState(const VKPipe::Pipeline &pipe,
 
       RDTreeWidgetItem *item = new RDTreeWidgetItem({heapNames[h], QString(), heapBinds[h]->buffer,
                                                      qulonglong(heapBinds[h]->offset), QString(),
-                                                     tr("%1 bytes").arg(heapBinds[h]->size)});
+                                                     tr("%1 bytes").arg(heapBinds[h]->size),
+                                                     QString()});
       // negative tags identify heaps, see descSet_itemActivated
       item->setTag(-1 - h);
       descSets->addTopLevelItem(item);
