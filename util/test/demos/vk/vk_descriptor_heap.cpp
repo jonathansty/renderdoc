@@ -105,6 +105,23 @@ void main()
 
 )EOSHADER";
 
+  // fragment shader for the regular descriptor set pipeline drawn between heap draws
+  const std::string nonHeapPixel = R"EOSHADER(
+#version 460 core
+
+layout(location = 0) in vec2 uv;
+
+layout(location = 0, index = 0) out vec4 Color;
+
+layout(set = 0, binding = 0) uniform sampler2D tex;
+
+void main()
+{
+  Color = texture(tex, uv);
+}
+
+)EOSHADER";
+
   static const uint32_t NUM_TESTS = 8;
 
   // shaders that index the heaps directly with SPV_EXT_descriptor_heap, without any set/binding
@@ -2414,6 +2431,80 @@ float4 psmain(V2F IN) : SV_Target0
                            VK_FORMAT_R8G8B8A8_UNORM);
     }
 
+    // a second pair of heaps, with a different reserved range, which the frame rebinds mid command
+    // buffer. They have different descriptors at the same indices the direct heap draw reads
+    const VkDeviceSize userHeapSize2 = 0x3000;
+
+    const VkDeviceSize resReservedOffset2 = Align(userHeapSize2, heapProps.resourceHeapAlignment);
+    const VkDeviceSize resReservedSize2 = resReservedSize + heapProps.resourceHeapAlignment;
+    const VkDeviceSize resHeapSize2 = resReservedOffset2 + resReservedSize2;
+
+    const VkDeviceSize sampReservedOffset2 = Align(userHeapSize2, heapProps.samplerHeapAlignment);
+    const VkDeviceSize sampReservedSize2 = sampReservedSize + heapProps.samplerHeapAlignment;
+    const VkDeviceSize sampHeapSize2 = sampReservedOffset2 + sampReservedSize2;
+
+    AllocatedBuffer resHeap2(
+        this,
+        vkh::BufferCreateInfo(resHeapSize2, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR |
+                                                VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT),
+        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}),
+        (uint32_t)heapProps.resourceHeapAlignment);
+    setName(resHeap2.buffer, "resHeap2");
+
+    AllocatedBuffer sampHeap2(
+        this,
+        vkh::BufferCreateInfo(sampHeapSize2, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR |
+                                                 VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT),
+        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}),
+        (uint32_t)heapProps.samplerHeapAlignment);
+    setName(sampHeap2.buffer, "sampHeap2");
+
+    {
+      byte *resPtr2 = resHeap2.map();
+      byte *sampPtr2 = sampHeap2.map();
+      memset(resPtr2, 0xcc, (size_t)resHeapSize2);
+      memset(sampPtr2, 0xcc, (size_t)sampHeapSize2);
+
+      // a different colour texture, and a buffer with a different colour and a bigger quad scale
+      VkImage heap2Tex = MakeTestImage("heap2Tex", Vec4f(0.0f, 1.0f, 1.0f, 1.0f));
+      VkDeviceAddress heap2Buf = MakeTestBuffer("heap2Buf", Vec4f(0.5f, 0.5f, 1.0f, 1.0f),
+                                                Vec4f(0.75f, 0.75f, 0.0f, 0.0f));
+
+      WriteImageDescriptor(resPtr2 + directTexIdx * imgSize, heap2Tex, VK_FORMAT_R8G8B8A8_UNORM);
+      WriteBufferDescriptor(resPtr2 + directBufIdx * bufSize, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            heap2Buf, 0x100);
+
+      // a different sampler: linear and repeating
+      vkh::SamplerCreateInfo sampInfo2(VK_FILTER_LINEAR);
+      sampInfo2.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      sampInfo2.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      sampInfo2.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      WriteSamplerDescriptor(sampPtr2 + directSampIdx * sampSize, sampInfo2);
+
+      resHeap2.unmap();
+      sampHeap2.unmap();
+    }
+
+    // a regular pipeline layout with a descriptor set, for a draw in between the heap draws
+    VkImage nonHeapTex = MakeTestImage("nonHeapTex", Vec4f(0.5f, 0.0f, 1.0f, 1.0f));
+    VkImageView nonHeapView = createImageView(
+        vkh::ImageViewCreateInfo(nonHeapTex, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM));
+    VkSampler nonHeapSampler = createSampler(vkh::SamplerCreateInfo(VK_FILTER_NEAREST));
+    VkDescriptorSetLayout nonHeapSetLayout =
+        createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo({
+            {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+             &nonHeapSampler},
+        }));
+    VkPipelineLayout nonHeapLayout =
+        createPipelineLayout(vkh::PipelineLayoutCreateInfo({nonHeapSetLayout}));
+    VkDescriptorSet nonHeapSet = allocateDescriptorSet(nonHeapSetLayout);
+    vkh::updateDescriptorSets(
+        device, {
+                    vkh::WriteDescriptorSet(
+                        nonHeapSet, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        {vkh::DescriptorImageInfo(nonHeapView, VK_IMAGE_LAYOUT_GENERAL)}),
+                });
+
     // embedded sampler, clamps to a white border so we can see it's used
     vkh::SamplerCreateInfo embeddedInfo(VK_FILTER_NEAREST);
     embeddedInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
@@ -2621,6 +2712,23 @@ float4 psmain(V2F IN) : SV_Target0
       bufferGraphicsPipe = createGraphicsPipeline(pipeCreateInfo);
     }
 
+    VkPipeline nonHeapPipe;
+    {
+      vkh::GraphicsPipelineCreateInfo regularInfo;
+
+      regularInfo.layout = nonHeapLayout;
+      regularInfo.renderPass = mainWindow->rp;
+      regularInfo.inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+
+      regularInfo.stages.resize(2);
+      regularInfo.stages[0] =
+          CompileShaderModule(vertex, ShaderLang::glsl, ShaderStage::vert, "main");
+      regularInfo.stages[1] =
+          CompileShaderModule(nonHeapPixel, ShaderLang::glsl, ShaderStage::frag, "main");
+
+      nonHeapPipe = createGraphicsPipeline(regularInfo);
+    }
+
     VkBindHeapInfoEXT resBind = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
     resBind.heapRange.address = resHeap.address;
     resBind.heapRange.size = resHeapSize;
@@ -2632,6 +2740,18 @@ float4 psmain(V2F IN) : SV_Target0
     sampBind.heapRange.size = sampHeapSize;
     sampBind.reservedRangeOffset = sampReservedOffset;
     sampBind.reservedRangeSize = sampReservedSize;
+
+    VkBindHeapInfoEXT resBind2 = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
+    resBind2.heapRange.address = resHeap2.address;
+    resBind2.heapRange.size = resHeapSize2;
+    resBind2.reservedRangeOffset = resReservedOffset2;
+    resBind2.reservedRangeSize = resReservedSize2;
+
+    VkBindHeapInfoEXT sampBind2 = {VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT};
+    sampBind2.heapRange.address = sampHeap2.address;
+    sampBind2.heapRange.size = sampHeapSize2;
+    sampBind2.reservedRangeOffset = sampReservedOffset2;
+    sampBind2.reservedRangeSize = sampReservedSize2;
 
     while(Running())
     {
@@ -2762,7 +2882,7 @@ float4 psmain(V2F IN) : SV_Target0
       vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
 
       const float cellW = float(screenWidth) / 4.0f;
-      const float cellH = float(screenHeight) / 3.0f;
+      const float cellH = float(screenHeight) / 4.0f;
 
       for(uint32_t t = 0; t < NUM_TESTS; t++)
       {
@@ -2827,6 +2947,118 @@ float4 psmain(V2F IN) : SV_Target0
         setMarker(cmd, "Heap Buffer Draw");
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bufferGraphicsPipe);
         vkCmdDraw(cmd, 3, 1, 0, 0);
+      }
+
+      // heap state changes in the same command buffer. Each draw is in its own cell, after the ones
+      // above
+      uint32_t cell = NUM_TESTS + 2;
+
+      auto setCell = [&]() {
+        VkViewport v = {cellW * float(cell % 4), cellH * float(cell / 4), cellW, cellH, 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &v);
+        cell++;
+      };
+
+      auto pushDirectHandles = [&](uint32_t texIdx) {
+        DirectDrawHandles handles = {};
+        handles.buf.index = directBufIdx;
+        handles.tex.index = texIdx;
+        handles.samp.index = directSampIdx;
+
+        VkPushDataInfoEXT pushInfo = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+        pushInfo.offset = 0;
+        pushInfo.data.address = &handles;
+        pushInfo.data.size = sizeof(handles);
+        vkCmdPushDataEXT(cmd, &pushInfo);
+      };
+
+      auto directDraw = [&](const char *marker) {
+        setMarker(cmd, marker);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, directGraphicsPipe);
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+      };
+
+      setMarker(cmd, "Heap2 Layout: resReservedOffset=" + std::to_string(resReservedOffset2) +
+                         " resReservedSize=" + std::to_string(resReservedSize2) +
+                         " resSize=" + std::to_string(resHeapSize2) +
+                         " sampReservedOffset=" + std::to_string(sampReservedOffset2) +
+                         " sampReservedSize=" + std::to_string(sampReservedSize2) +
+                         " sampSize=" + std::to_string(sampHeapSize2) +
+                         " resReservedOffset1=" + std::to_string(resReservedOffset) +
+                         " resReservedSize1=" + std::to_string(resReservedSize) +
+                         " resSize1=" + std::to_string(resHeapSize) +
+                         " sampReservedOffset1=" + std::to_string(sampReservedOffset) +
+                         " sampReservedSize1=" + std::to_string(sampReservedSize) +
+                         " sampSize1=" + std::to_string(sampHeapSize) +
+                         " tex=" + std::to_string(directTexIdx) +
+                         " unusedTex=" + std::to_string(directUnusedTexIdx) +
+                         " buf=" + std::to_string(directBufIdx) +
+                         " samp=" + std::to_string(directSampIdx) +
+                         " imgSize=" + std::to_string(imgSize) +
+                         " bufSize=" + std::to_string(bufSize) +
+                         " sampDescSize=" + std::to_string(sampSize));
+
+      // both heaps replaced by the second pair, which have different descriptors at the same indices
+      {
+        setCell();
+        vkCmdBindResourceHeapEXT(cmd, &resBind2);
+        vkCmdBindSamplerHeapEXT(cmd, &sampBind2);
+        pushDirectHandles(directTexIdx);
+        directDraw("Heap Rebind Draw");
+      }
+
+      // only the resource heap is rebound back to the original, the second sampler heap stays
+      {
+        setCell();
+        vkCmdBindResourceHeapEXT(cmd, &resBind);
+        directDraw("Heap Rebind One");
+      }
+
+      // both back to the originals
+      {
+        setCell();
+        vkCmdBindResourceHeapEXT(cmd, &resBind);
+        vkCmdBindSamplerHeapEXT(cmd, &sampBind);
+        directDraw("Heap Rebind Back");
+      }
+
+      // push data in two parts. The first push has the wrong texture, which the second push at a
+      // non-zero offset overwrites (the handles are 8 bytes each: buf at 0, tex at 8, samp at 16)
+      {
+        setCell();
+        pushDirectHandles(directUnusedTexIdx);
+
+        DirectDrawHandles handles = {};
+        handles.tex.index = directTexIdx;
+        handles.samp.index = directSampIdx;
+
+        VkPushDataInfoEXT pushInfo = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+        pushInfo.offset = offsetof(DirectDrawHandles, tex);
+        pushInfo.data.address = &handles.tex;
+        pushInfo.data.size = sizeof(handles) - offsetof(DirectDrawHandles, tex);
+        vkCmdPushDataEXT(cmd, &pushInfo);
+
+        directDraw("Heap Push Offset Draw");
+      }
+
+      // a regular pipeline with a descriptor set
+      {
+        setCell();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nonHeapPipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nonHeapLayout, 0, 1,
+                                &nonHeapSet, 0, NULL);
+        setMarker(cmd, "Non-Heap Draw");
+        vkCmdDraw(cmd, 4, 1, 0, 0);
+      }
+
+      // vkCmdBindDescriptorSets switches the command buffer to 'classic descriptor' mode, which
+      // invalidates the bound heaps (validation reports VUID-vkCmdDraw-None-11308 otherwise), so
+      // the heaps have to be bound again. This time bind the second pair
+      {
+        setCell();
+        vkCmdBindResourceHeapEXT(cmd, &resBind2);
+        vkCmdBindSamplerHeapEXT(cmd, &sampBind2);
+        directDraw("Heap After Non-Heap");
       }
 
       vkCmdEndRenderPass(cmd);
