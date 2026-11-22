@@ -185,7 +185,12 @@ rdcstr Reflector::Disassemble(const rdcstr &entryPoint, const rdcarray<SpecConst
     if(typeId == Id())
       return idName(id);
 
-    rdcstr ret = dataTypes[typeId].name;
+    // some types aren't registered as data types (e.g. OpTypeUntypedPointerKHR), fall back to the
+    // generic name rather than looking them up
+    rdcstr ret;
+    auto typeIt = dataTypes.find(typeId);
+    if(typeIt != dataTypes.end())
+      ret = typeIt->second.name;
     if(ret.empty())
       ret = StringFormat::Fmt("type%u", typeId.value());
 
