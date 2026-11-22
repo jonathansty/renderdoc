@@ -44,6 +44,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_heap_descriptors()
 
+        self.check_heap_view_variety()
+
         self.check_mapped_accesses()
 
         self.check_direct_heap_access()
@@ -425,6 +427,124 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             raise rdtest.TestFailureException(f"Unexpected sampler heap location name {locs[0].logicalBindName}")
 
         rdtest.log.success("Heap descriptors decoded as expected")
+
+    def check_heap_view_variety(self):
+        """Image views with array/mip ranges, cube, depth and swizzled views, and buffer descriptors with ranges
+        into the middle of a buffer"""
+        view_action = self.find_action("Heap Views:")
+
+        if view_action is None:
+            raise rdtest.TestFailureException("Couldn't find the heap views marker")
+
+        layout = {}
+        for item in view_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        draw = self.find_action("Heap Test 0")
+        self.set_event(draw.nextAction.eventId, False)
+
+        res_heap = self.controller.GetVulkanPipelineState().resourceHeap.buffer
+
+        img_size = layout['imgSize']
+        buf_size = layout['bufSize']
+
+        T = rd.TextureType
+        S = rd.TextureSwizzle
+        ident = (S.Red, S.Green, S.Blue, S.Alpha)
+
+        # key, name, type, texture type, first mip, num mips, first slice, num slices, comp type, comp count, comp
+        # byte width, swizzle
+        images = [
+            ('array', "viewArrayTex", rd.DescriptorType.Image, T.Texture2DArray, 0, 1, 1, 2,
+             rd.CompType.UNorm, 4, 1, ident),
+            ('mip', "viewMipTex", rd.DescriptorType.Image, T.Texture2D, 1, 2, 0, 1,
+             rd.CompType.UNorm, 4, 1, ident),
+            ('cube', "viewCubeTex", rd.DescriptorType.Image, T.TextureCube, 0, 1, 0, 6,
+             rd.CompType.UNorm, 4, 1, ident),
+            ('cubeStorage', "viewCubeTex", rd.DescriptorType.ReadWriteImage, T.Texture2DArray, 0, 1, 0, 6,
+             rd.CompType.UNorm, 4, 1, ident),
+            ('depth', "viewDepthTex", rd.DescriptorType.Image, T.Texture2D, 0, 1, 0, 1,
+             rd.CompType.Depth, 1, 4, ident),
+            ('swizzle', "viewFloatTex", rd.DescriptorType.Image, T.Texture2D, 0, 1, 0, 1,
+             rd.CompType.Float, 4, 2, (S.Blue, S.Green, S.Red, S.Alpha)),
+            ('swizzleR32', "viewR32Tex", rd.DescriptorType.Image, T.Texture2D, 0, 1, 0, 1,
+             rd.CompType.Float, 1, 4, (S.One, S.Red, S.Zero, S.Alpha)),
+        ]
+
+        def fetch(offset, desc_type, size):
+            r = rd.DescriptorRange()
+            r.offset = offset
+            r.descriptorSize = size
+            r.count = 1
+            r.type = desc_type
+            return r
+
+        def res_name(rid):
+            return self.get_resource(rid).name if rid != rd.ResourceId() else None
+
+        for key, name, typ, tex_type, first_mip, num_mips, first_slice, num_slices, comp, count, width, swz in images:
+            r = fetch(layout[key] * img_size, typ, img_size)
+            d = self.controller.GetDescriptors(res_heap, [r])[0]
+
+            got = res_name(d.resource)
+            if d.type != typ or got != name:
+                raise rdtest.TestFailureException(f"View '{key}' expected to be {typ} {name}, got {d.type} {got}")
+
+            if d.view == rd.ResourceId():
+                raise rdtest.TestFailureException(f"View '{key}' has no view object")
+
+            if d.textureType != tex_type:
+                raise rdtest.TestFailureException(f"View '{key}' has texture type {d.textureType}, expected {tex_type}")
+
+            got_range = (d.firstMip, d.numMips, d.firstSlice, d.numSlices)
+            if got_range != (first_mip, num_mips, first_slice, num_slices):
+                raise rdtest.TestFailureException(
+                    f"View '{key}' has range {got_range}, expected {(first_mip, num_mips, first_slice, num_slices)}")
+
+            f = d.format
+            if f.compType != comp or f.compCount != count or f.compByteWidth != width:
+                raise rdtest.TestFailureException(f"View '{key}' has unexpected format {f.Name()}")
+
+            got_swz = (d.swizzle.red, d.swizzle.green, d.swizzle.blue, d.swizzle.alpha)
+            if got_swz != swz:
+                raise rdtest.TestFailureException(f"View '{key}' has swizzle {got_swz}, expected {swz}")
+
+            loc = self.controller.GetDescriptorLocations(res_heap, [r])[0]
+            if loc.logicalBindName != f"ResourceHeap[{layout[key]}]":
+                raise rdtest.TestFailureException(f"View '{key}' has location name {loc.logicalBindName}")
+
+        # the cube and its storage view are of the same image but different views
+        cube_descs = self.controller.GetDescriptors(res_heap, [
+            fetch(layout['cube'] * img_size, rd.DescriptorType.Image, img_size),
+            fetch(layout['cubeStorage'] * img_size, rd.DescriptorType.ReadWriteImage, img_size)])
+        if cube_descs[0].resource != cube_descs[1].resource or cube_descs[0].view == cube_descs[1].view:
+            raise rdtest.TestFailureException("Cube and storage views should be different views of the same image")
+
+        # buffers: a range in the middle of a bigger buffer, and a small range
+        buffers = [
+            ('ubo', rd.DescriptorType.ConstantBuffer, 0x40, 0x80),
+            ('ssbo', rd.DescriptorType.ReadWriteBuffer, 0x40, 0x80),
+            ('ssboPartial', rd.DescriptorType.ReadWriteBuffer, layout['partialOffset'], layout['partialSize']),
+        ]
+
+        for key, typ, offset, size in buffers:
+            r = fetch(layout[key] * buf_size, typ, buf_size)
+            d = self.controller.GetDescriptors(res_heap, [r])[0]
+
+            got = res_name(d.resource)
+            if d.type != typ or got != "viewRangeBuffer":
+                raise rdtest.TestFailureException(f"Buffer '{key}' expected to be {typ} viewRangeBuffer, got {d.type} {got}")
+
+            if d.byteOffset != offset or d.byteSize != size:
+                raise rdtest.TestFailureException(
+                    f"Buffer '{key}' has range {d.byteOffset}/{d.byteSize}, expected {offset}/{size}")
+
+            loc = self.controller.GetDescriptorLocations(res_heap, [r])[0]
+            if loc.logicalBindName != f"ResourceHeap[{layout[key]}]":
+                raise rdtest.TestFailureException(f"Buffer '{key}' has location name {loc.logicalBindName}")
+
+        rdtest.log.success("Heap view variety and buffer ranges decoded as expected")
 
     def check_mapped_accesses(self):
         """Static descriptor access for set/binding resources mapped to the heaps by the tests' pipelines"""

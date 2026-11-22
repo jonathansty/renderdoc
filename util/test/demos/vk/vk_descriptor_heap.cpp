@@ -2203,6 +2203,88 @@ float4 psmain(V2F IN) : SV_Target0
     return buf.address;
   }
 
+  void WriteImageViewDescriptor(void *dst, const VkImageViewCreateInfo &view,
+                                VkDescriptorType type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+  {
+    VkImageDescriptorInfoEXT imgInfo = {VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT};
+    imgInfo.pView = &view;
+    imgInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkResourceDescriptorInfoEXT info = {VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT};
+    info.type = type;
+    info.data.pImage = &imgInfo;
+
+    VkHostAddressRangeEXT host = {dst, (size_t)heapProps.imageDescriptorSize};
+
+    CHECK_VKR(vkWriteResourceDescriptorsEXT(device, 1, &info, &host));
+  }
+
+  // an image with an arbitrary format/mips/layers, where every mip and layer is cleared to a
+  // different colour, left in GENERAL layout
+  VkImage MakeViewImage(const char *name, VkFormat format, VkImageUsageFlags usage, uint32_t mips,
+                        uint32_t layers, VkImageCreateFlags flags = 0,
+                        VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT)
+  {
+    AllocatedImage tex(
+        this,
+        vkh::ImageCreateInfo(texSize, texSize, 0, format, usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             mips, layers, VK_SAMPLE_COUNT_1_BIT, flags),
+        VmaAllocationCreateInfo(
+            {VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT, VMA_MEMORY_USAGE_GPU_ONLY}));
+    setName(tex.image, name);
+
+    VkCommandBuffer cmd = GetCommandBuffer();
+    vkBeginCommandBuffer(cmd, vkh::CommandBufferBeginInfo());
+
+    vkh::cmdPipelineBarrier(
+        cmd, {
+                 vkh::ImageMemoryBarrier(0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, tex.image,
+                                         {aspect, 0, mips, 0, layers}),
+             });
+
+    for(uint32_t m = 0; m < mips; m++)
+    {
+      for(uint32_t l = 0; l < layers; l++)
+      {
+        VkImageSubresourceRange range = {aspect, m, 1, l, 1};
+
+        if(aspect == VK_IMAGE_ASPECT_COLOR_BIT)
+        {
+          VkClearColorValue col = {};
+          col.float32[0] = 0.2f * float(l + 1);
+          col.float32[1] = 0.25f * float(m + 1);
+          col.float32[2] = 0.5f;
+          col.float32[3] = 1.0f;
+          vkCmdClearColorImage(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col, 1,
+                               &range);
+        }
+        else
+        {
+          VkClearDepthStencilValue ds = {0.5f, 0};
+          vkCmdClearDepthStencilImage(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ds, 1,
+                                      &range);
+        }
+      }
+    }
+
+    vkh::cmdPipelineBarrier(
+        cmd, {
+                 vkh::ImageMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                         VK_IMAGE_LAYOUT_GENERAL, tex.image,
+                                         {aspect, 0, mips, 0, layers}),
+             });
+
+    vkEndCommandBuffer(cmd);
+    Submit(99, 99, {cmd});
+    vkDeviceWaitIdle(device);
+
+    images.push_back(tex);
+
+    return tex.image;
+  }
+
   int main()
   {
     vmaBDA = true;
@@ -2279,6 +2361,45 @@ float4 psmain(V2F IN) : SV_Target0
     const uint32_t bufferDrawTexIdx = directTexIdx + 4;
     const uint32_t directSampIdx = (0x1000 + sampSize - 1) / sampSize;
     const uint32_t directUnusedSampIdx = directSampIdx + 1;
+
+    // image view variety and buffer ranges, after the heap buffer demonstration resources
+    const uint32_t numViewImages = 7;
+    const uint32_t numViewBuffers = 3;
+    const uint32_t viewByteBase = (uint32_t)Align(0x1800 + 12 * bufSize, 0x100);
+    const uint32_t viewImgIdx = (viewByteBase + imgSize - 1) / imgSize;
+    const uint32_t viewBufIdx = ((viewImgIdx + numViewImages) * imgSize + bufSize - 1) / bufSize;
+
+    if((viewBufIdx + numViewBuffers) * bufSize > userHeapSize)
+    {
+      TEST_ERROR("Descriptor sizes are too big to fit the view variety descriptors");
+      return 4;
+    }
+
+    // slot order: 2D array layers 1..2, mip 1..2, cube, cube as storage 2D array, depth, float with
+    // BGRA swizzle, single channel float with R->ONE swizzle
+    const uint32_t viewArrayIdx = viewImgIdx + 0;
+    const uint32_t viewMipIdx = viewImgIdx + 1;
+    const uint32_t viewCubeIdx = viewImgIdx + 2;
+    const uint32_t viewCubeStorageIdx = viewImgIdx + 3;
+    const uint32_t viewDepthIdx = viewImgIdx + 4;
+    const uint32_t viewSwizzleIdx = viewImgIdx + 5;
+    const uint32_t viewSwizzleR32Idx = viewImgIdx + 6;
+    // UBO and SSBO into the middle of a bigger buffer, and a small unaligned SSBO range
+    const uint32_t viewUboIdx = viewBufIdx + 0;
+    const uint32_t viewSsboIdx = viewBufIdx + 1;
+    const uint32_t viewSsboPartialIdx = viewBufIdx + 2;
+    const VkDeviceSize viewBufOffset = 0x40;
+    const VkDeviceSize viewBufSize = 0x80;
+    const VkDeviceSize viewPartialOffset =
+        std::max<VkDeviceSize>(0x10, physProperties.limits.minStorageBufferOffsetAlignment);
+    const VkDeviceSize viewPartialSize = 0x21;
+
+    if(viewBufOffset % physProperties.limits.minUniformBufferOffsetAlignment != 0 ||
+       viewBufOffset % physProperties.limits.minStorageBufferOffsetAlignment != 0)
+    {
+      TEST_ERROR("Buffer offset alignment too large for the view variety descriptors");
+      return 4;
+    }
 
     AllocatedBuffer resHeap(
         this,
@@ -2429,6 +2550,71 @@ float4 psmain(V2F IN) : SV_Target0
                             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, bufferDrawConsts, sizeof(tint));
       WriteImageDescriptor(resPtr + bufferDrawTexIdx * imgSize, bufferDrawTex,
                            VK_FORMAT_R8G8B8A8_UNORM);
+    }
+
+    // image view variety and buffer ranges
+    {
+      const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT;
+      const VkComponentMapping ident = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+
+      VkImage arrayImg = MakeViewImage("viewArrayTex", VK_FORMAT_R8G8B8A8_UNORM, sampled, 1, 4);
+      WriteImageViewDescriptor(
+          resPtr + viewArrayIdx * imgSize,
+          vkh::ImageViewCreateInfo(arrayImg, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_FORMAT_R8G8B8A8_UNORM,
+                                   ident, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, 2}));
+
+      VkImage mipImg = MakeViewImage("viewMipTex", VK_FORMAT_R8G8B8A8_UNORM, sampled, 3, 1);
+      WriteImageViewDescriptor(
+          resPtr + viewMipIdx * imgSize,
+          vkh::ImageViewCreateInfo(mipImg, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, ident,
+                                   {VK_IMAGE_ASPECT_COLOR_BIT, 1, 2, 0, 1}));
+
+      VkImage cubeImg = MakeViewImage("viewCubeTex", VK_FORMAT_R8G8B8A8_UNORM,
+                                      sampled | VK_IMAGE_USAGE_STORAGE_BIT, 1, 6,
+                                      VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
+      WriteImageViewDescriptor(
+          resPtr + viewCubeIdx * imgSize,
+          vkh::ImageViewCreateInfo(cubeImg, VK_IMAGE_VIEW_TYPE_CUBE, VK_FORMAT_R8G8B8A8_UNORM, ident,
+                                   {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6}));
+      WriteImageViewDescriptor(
+          resPtr + viewCubeStorageIdx * imgSize,
+          vkh::ImageViewCreateInfo(cubeImg, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_FORMAT_R8G8B8A8_UNORM,
+                                   ident, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6}),
+          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+
+      VkImage depthImg = MakeViewImage("viewDepthTex", VK_FORMAT_D32_SFLOAT, sampled, 1, 1, 0,
+                                       VK_IMAGE_ASPECT_DEPTH_BIT);
+      WriteImageViewDescriptor(
+          resPtr + viewDepthIdx * imgSize,
+          vkh::ImageViewCreateInfo(depthImg, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_D32_SFLOAT, ident,
+                                   {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}));
+
+      VkImage floatImg = MakeViewImage("viewFloatTex", VK_FORMAT_R16G16B16A16_SFLOAT, sampled, 1, 1);
+      WriteImageViewDescriptor(
+          resPtr + viewSwizzleIdx * imgSize,
+          vkh::ImageViewCreateInfo(floatImg, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                   {VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G,
+                                    VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_IDENTITY}));
+
+      VkImage r32Img = MakeViewImage("viewR32Tex", VK_FORMAT_R32_SFLOAT, sampled, 1, 1);
+      WriteImageViewDescriptor(
+          resPtr + viewSwizzleR32Idx * imgSize,
+          vkh::ImageViewCreateInfo(r32Img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R32_SFLOAT,
+                                   {VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R,
+                                    VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_IDENTITY}));
+
+      // ranges into the middle of a bigger buffer, and a small unaligned range
+      byte zeroes[0x400] = {};
+      VkDeviceAddress rangeBuf = MakeDataBuffer("viewRangeBuffer", zeroes, sizeof(zeroes));
+
+      WriteBufferDescriptor(resPtr + viewUboIdx * bufSize, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                            rangeBuf + viewBufOffset, viewBufSize);
+      WriteBufferDescriptor(resPtr + viewSsboIdx * bufSize, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            rangeBuf + viewBufOffset, viewBufSize);
+      WriteBufferDescriptor(resPtr + viewSsboPartialIdx * bufSize,
+                            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rangeBuf + viewPartialOffset,
+                            viewPartialSize);
     }
 
     // a second pair of heaps, with a different reserved range, which the frame rebinds mid command
@@ -2878,6 +3064,21 @@ float4 psmain(V2F IN) : SV_Target0
                          " texArray=" + std::to_string(texArrayOffset) +
                          " samp=" + std::to_string(sampOffset) +
                          " customSamp=" + std::to_string(customSampOffset));
+
+      setMarker(cmd, "Heap Views: imgSize=" + std::to_string(imgSize) +
+                         " bufSize=" + std::to_string(bufSize) +
+                         " array=" + std::to_string(viewArrayIdx) +
+                         " mip=" + std::to_string(viewMipIdx) +
+                         " cube=" + std::to_string(viewCubeIdx) +
+                         " cubeStorage=" + std::to_string(viewCubeStorageIdx) +
+                         " depth=" + std::to_string(viewDepthIdx) +
+                         " swizzle=" + std::to_string(viewSwizzleIdx) +
+                         " swizzleR32=" + std::to_string(viewSwizzleR32Idx) +
+                         " ubo=" + std::to_string(viewUboIdx) +
+                         " ssbo=" + std::to_string(viewSsboIdx) +
+                         " ssboPartial=" + std::to_string(viewSsboPartialIdx) +
+                         " partialOffset=" + std::to_string(viewPartialOffset) +
+                         " partialSize=" + std::to_string(viewPartialSize));
 
       vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
 
