@@ -93,27 +93,42 @@ static void MakeSubpassLoadRP(RPCreateInfo &info, const RPCreateInfo *origInfo, 
   // optional and omitting it only makes invalid behaviour valid
   RemoveNextStruct(&info, VK_STRUCTURE_TYPE_RENDER_PASS_INPUT_ATTACHMENT_ASPECT_CREATE_INFO);
 
-  // remove any non-self dependencies
+  // remove any dependencies on other subpasses. We keep the first self-dependency of the target
+  // subpass and any external dependencies of it, so that a single-subpass renderpass stays identical
+  // and therefore compatible with pipelines created against the original (dependencies are part of
+  // renderpass compatibility).
   info.dependencyCount = 0;
+  bool selfDep = false;
   for(uint32_t i = 0; i < origInfo->dependencyCount; i++)
   {
-    // if this dependency is a self-dependency for the target subpass, keep it
-    if(origInfo->pDependencies[i].srcSubpass == origInfo->pDependencies[i].dstSubpass &&
-       origInfo->pDependencies[i].srcSubpass == s)
-    {
-      uint32_t d = info.dependencyCount;
-      info.dependencyCount++;
+    const uint32_t src = origInfo->pDependencies[i].srcSubpass;
+    const uint32_t dst = origInfo->pDependencies[i].dstSubpass;
 
-      // copy the dependency
-      memcpy((void *)&info.pDependencies[d], &origInfo->pDependencies[i],
-             sizeof(origInfo->pDependencies[i]));
+    const bool isSelf = (src == s && dst == s);
+    const bool isExternal = (src == VK_SUBPASS_EXTERNAL && dst == s) ||
+                            (src == s && dst == VK_SUBPASS_EXTERNAL);
 
-      // set the srcSubpass/dstSubpass to 0 since we're rewriting this renderpass to contain one
-      // subpass only
+    if(isSelf && selfDep)
+      continue;
+
+    if(!isSelf && !isExternal)
+      continue;
+
+    selfDep |= isSelf;
+
+    uint32_t d = info.dependencyCount;
+    info.dependencyCount++;
+
+    // copy the dependency
+    memcpy((void *)&info.pDependencies[d], &origInfo->pDependencies[i],
+           sizeof(origInfo->pDependencies[i]));
+
+    // remap the target subpass to 0 since we're rewriting this renderpass to contain one subpass
+    // only
+    if(src == s)
       RDCEraseEl(info.pDependencies[d].srcSubpass);
+    if(dst == s)
       RDCEraseEl(info.pDependencies[d].dstSubpass);
-      break;
-    }
   }
 
   // we use decltype here because this is templated to work for regular and create_renderpass2
@@ -1292,6 +1307,11 @@ bool WrappedVulkan::Serialise_vkCreateRenderPass(SerialiserType &ser, VkDevice d
 
         VkRenderPassCreateInfo loadInfo = CreateInfo;
 
+        // copy the dependencies so we can mutate them without modifying CreateInfo
+        rdcarray<VkSubpassDependency> loadDeps;
+        loadDeps.assign(CreateInfo.pDependencies, CreateInfo.dependencyCount);
+        loadInfo.pDependencies = loadDeps.data();
+
         {
           byte *tempMem = GetTempMemory(GetNextPatchSize(loadInfo.pNext));
           CopyNextChainForPatching("VkRenderPassCreateInfo", tempMem, (VkBaseInStructure *)&loadInfo);
@@ -1549,6 +1569,11 @@ bool WrappedVulkan::Serialise_vkCreateRenderPass2(SerialiserType &ser, VkDevice 
         }
 
         VkRenderPassCreateInfo2 loadInfo = CreateInfo;
+
+        // copy the dependencies so we can mutate them without modifying CreateInfo
+        rdcarray<VkSubpassDependency2> loadDeps;
+        loadDeps.assign(CreateInfo.pDependencies, CreateInfo.dependencyCount);
+        loadInfo.pDependencies = loadDeps.data();
 
         {
           byte *tempMem = GetTempMemory(GetNextPatchSize(loadInfo.pNext));
