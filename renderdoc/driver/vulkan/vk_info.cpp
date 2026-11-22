@@ -869,7 +869,8 @@ const VkSamplerCreateInfo **GetDescriptorMappingEmbeddedSampler(VkDescriptorSetA
   }
 }
 
-void VulkanCreationInfo::ShaderEntry::InitDescriptorMappings(const void *stageOrShaderInfo)
+void VulkanCreationInfo::ShaderEntry::InitDescriptorMappings(VulkanCreationInfo &info,
+                                                             const void *stageOrShaderInfo)
 {
   descriptorMappings.clear();
 
@@ -911,6 +912,14 @@ void VulkanCreationInfo::ShaderEntry::InitDescriptorMappings(const void *stageOr
               src, VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO);
       if(ycbcr)
         dst.ycbcr = GetResID(ycbcr->conversion);
+
+      // there is no VkSampler to key the sampler info on, so use a fake id and decode the create
+      // info the same way as for a real sampler
+      dst.samplerId = ResourceIDGen::GetNewUniqueID();
+      VulkanCreationInfo::Sampler &sampInfo = info.m_Sampler[dst.samplerId];
+      sampInfo.Init(NULL, info, src);
+      sampInfo.embedded = true;
+      sampInfo.embeddedBinding = dst.mapping.firstBinding;
 
       *embedded = NULL;
     }
@@ -1189,7 +1198,6 @@ static void ProcessStaticHeapMappedDescriptorAccess(
   access.byteSize = 1;
 
   // arrayed descriptors will be handled with bindless feedback (TODO(heap 5.4))
-  // embedded samplers are not in any heap (TODO(heap 5.3)) so they are never reported here
   auto add = [&](DescriptorType type, uint16_t idx, uint32_t set, uint32_t bind,
                  VkSpirvResourceTypeFlagsEXT typeMask) {
     if(typeMask == 0)
@@ -1200,11 +1208,9 @@ static void ProcessStaticHeapMappedDescriptorAccess(
     if(!dm)
       return;
 
-    // plain samplers with an embedded sampler are not in any heap. For combined image samplers the
-    // image part is still in the resource heap
-    if(dm->hasEmbeddedSampler && (typeMask & VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT))
-      return;
-
+    // plain samplers with an embedded sampler are reported with the embedded sampler as the store
+    // (resolved in GetDescriptorAccess). For combined image samplers only the image part in the
+    // resource heap is reported, as for combined image samplers with a sampler heap sampler
     access.type = type;
     access.index = idx;
     descriptorAccess.push_back(access);
@@ -1275,7 +1281,7 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
 
   shad.entryPoint = pCreateInfo->pName;
 
-  shad.InitDescriptorMappings(pCreateInfo);
+  shad.InitDescriptorMappings(info, pCreateInfo);
 
   // descriptor set layouts
   if(pCreateInfo->pSetLayouts)
@@ -1499,7 +1505,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     shad.stage = ShaderStage(stageIndex);
     shad.flags = pCreateInfo->pStages[i].flags;
 
-    shad.InitDescriptorMappings(&pCreateInfo->pStages[i]);
+    shad.InitDescriptorMappings(info, &pCreateInfo->pStages[i]);
 
     ShaderModuleReflectionKey key(shad.stage, shad.entryPoint, ResourceId());
 
@@ -2214,7 +2220,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
     shad.stage = ShaderStage::Compute;
     shad.flags = pCreateInfo->stage.flags;
 
-    shad.InitDescriptorMappings(&pCreateInfo->stage);
+    shad.InitDescriptorMappings(info, &pCreateInfo->stage);
 
     ShaderModuleReflectionKey key(ShaderStage::Compute, shad.entryPoint, ResourceId());
 

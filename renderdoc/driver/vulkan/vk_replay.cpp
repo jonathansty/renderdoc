@@ -2807,8 +2807,11 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
   }
 
   // check for descriptor buffer embedded samplers, which show up as entries in the set layout
+  // (or the embedded samplers of descriptor heap mappings, which are keyed by a fake sampler id)
   if(m_pDriver->m_CreationInfo.m_DescSetLayout.find(descriptorStore) !=
-     m_pDriver->m_CreationInfo.m_DescSetLayout.end())
+         m_pDriver->m_CreationInfo.m_DescSetLayout.end() ||
+     m_pDriver->m_CreationInfo.m_Sampler.find(descriptorStore) !=
+         m_pDriver->m_CreationInfo.m_Sampler.end())
   {
     for(Descriptor &d : ret)
     {
@@ -2957,6 +2960,24 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
         dst++;
         descriptor += r.descriptorSize;
       }
+    }
+
+    return ret;
+  }
+
+  // embedded sampler of a descriptor heap mapping. The store is a fake id which is the key of the
+  // sampler info in the creation info (there is no VkSampler object, so no object is reported)
+  if(m_pDriver->m_CreationInfo.m_Sampler.find(descriptorStore) !=
+     m_pDriver->m_CreationInfo.m_Sampler.end())
+  {
+    DescriptorSetSlot tmp = {};
+    tmp.SetSampler(descriptorStore);
+
+    for(SamplerDescriptor &d : ret)
+    {
+      FillSamplerDescriptor(d, tmp);
+      d.object = ResourceId();
+      d.creationTimeConstant = true;
     }
 
     return ret;
@@ -3130,8 +3151,21 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
     else if(res.kind == HeapMappingKind::SamplerHeap)
       heap = &state.samplerHeap;
 
-    // TODO(heap 5.3/5.6): embedded samplers, push address, heap data and indirect sources are not
-    // resolved to a descriptor store yet. Uniform buffers backed by push data could be shown like
+    // embedded samplers are not in any heap, their store is a fake id (see
+    // ShaderEntry::DescriptorMapping::samplerId) which is decoded from the creation info
+    if(res.kind == HeapMappingKind::EmbeddedSampler)
+    {
+      if(res.mappingIndex < shad.descriptorMappings.size())
+      {
+        access.descriptorStore = shad.descriptorMappings[res.mappingIndex].samplerId;
+        access.byteOffset = 0;
+        access.byteSize = 1;
+      }
+      return;
+    }
+
+    // TODO(heap 5.6): push address, heap data and indirect sources are not resolved to a descriptor
+    // store yet. Uniform buffers backed by push data could be shown like
     // push constants (store = GetPushConstantCommandBuffer()) once the UI handles the offset.
     // The sampler part of a combined image sampler lives in the sampler heap which can't be
     // expressed by a single access, so only the image part is reported (heap combined image
@@ -3203,6 +3237,12 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
     if(access.descriptorStore == VulkanCreationInfo::pushConstantDescriptorStorage)
     {
       access.descriptorStore = m_pDriver->GetPushConstantCommandBuffer();
+    }
+    else if(m_pDriver->m_CreationInfo.m_Sampler.find(access.descriptorStore) !=
+                m_pDriver->m_CreationInfo.m_Sampler.end() &&
+            m_pDriver->m_CreationInfo.m_Sampler[access.descriptorStore].embedded)
+    {
+      // embedded sampler of a heap mapping, already resolved
     }
     else
     {
@@ -3381,6 +3421,20 @@ rdcarray<DescriptorLogicalLocation> VulkanReplay::GetDescriptorLocations(
             "%s[%u]", r.type == DescriptorType::Sampler ? "SamplerHeap" : "ResourceHeap",
             byteOffset / stride);
       }
+    }
+
+    return ret;
+  }
+
+  // embedded samplers of descriptor heap mappings
+  auto embeddedSampler = m_pDriver->m_CreationInfo.m_Sampler.find(descriptorStore);
+  if(embeddedSampler != m_pDriver->m_CreationInfo.m_Sampler.end())
+  {
+    for(DescriptorLogicalLocation &d : ret)
+    {
+      d.category = DescriptorCategory::Sampler;
+      d.fixedBindNumber = embeddedSampler->second.embeddedBinding;
+      d.logicalBindName = "Embedded Sampler";
     }
 
     return ret;

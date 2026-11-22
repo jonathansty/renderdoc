@@ -279,11 +279,16 @@ struct VulkanCreationInfo
       bool hasBorderColor = false;
       VkSamplerCustomBorderColorCreateInfoEXT borderColor = {};
       ResourceId ycbcr;
+
+      // for embedded samplers, a fake ResourceId which is both the descriptor store reported for the
+      // sampler and the key of its entry in VulkanCreationInfo::m_Sampler (there is no VkSampler
+      // object, so it is not a real resource). The store is always read at byte offset 0
+      ResourceId samplerId;
     };
     rdcarray<DescriptorMapping> descriptorMappings;
 
     // stageOrShaderInfo is a VkPipelineShaderStageCreateInfo or VkShaderCreateInfoEXT
-    void InitDescriptorMappings(const void *stageOrShaderInfo);
+    void InitDescriptorMappings(VulkanCreationInfo &info, const void *stageOrShaderInfo);
 
     bool HasRobustness() const
     {
@@ -777,6 +782,11 @@ struct VulkanCreationInfo
 
     // VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT
     bool seamless;
+
+    // for the embedded samplers of descriptor heap mappings, which have no VkSampler. The key in
+    // m_Sampler is then a fake id used as a descriptor store, see ShaderEntry::DescriptorMapping
+    bool embedded = false;
+    uint32_t embeddedBinding = 0;
   };
   std::unordered_map<ResourceId, Sampler> m_Sampler;
 

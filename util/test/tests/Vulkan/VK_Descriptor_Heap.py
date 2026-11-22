@@ -576,7 +576,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
              (frag, rd.DescriptorType.Sampler, 'samp', layout['samp'], None)],
             [(frag, rd.DescriptorType.Image, 'res', layout['texArray'] + img_stride, 'texArray1'),
              (frag, rd.DescriptorType.Sampler, 'samp', layout['samp'], None)],
-            [(frag, rd.DescriptorType.Image, 'res', layout['tex'], 'tex0')],
+            [(frag, rd.DescriptorType.Image, 'res', layout['tex'], 'tex0'),
+             (frag, rd.DescriptorType.Sampler, 'embedded', 0, None)],
             [(frag, rd.DescriptorType.Image, 'res', layout['tex'], 'tex0'),
              (frag, rd.DescriptorType.Sampler, 'samp', layout['customSamp'], None)],
         ]
@@ -613,6 +614,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
                         continue
 
                 heap = [k for k, v in heaps.items() if v == a.descriptorStore]
+                if a.type == rd.DescriptorType.Sampler and not heap:
+                    heap = ['embedded']
                 if len(heap) != 1:
                     raise rdtest.TestFailureException(
                         f"Heap Test {test}: access {a.type} {a.index} has unexpected store {a.descriptorStore}")
@@ -624,7 +627,20 @@ class VK_Descriptor_Heap(rdtest.TestCase):
                     border = [round(x, 2) for x in samp.borderColorValue.floatValue]
                     if test == 7 and border != [0.5, 0.25, 0.75, 1.0]:
                         raise rdtest.TestFailureException(f"Heap Test {test}: sampler border is {border}")
-                    if test != 7 and samp.addressU != rd.AddressMode.ClampEdge:
+                    if test == 6:
+                        # embedded: nearest, clamp to opaque white border, no object, creation time constant
+                        if (samp.filter.minify != rd.FilterMode.Point or samp.filter.magnify != rd.FilterMode.Point
+                                or samp.addressU != rd.AddressMode.ClampBorder
+                                or samp.addressV != rd.AddressMode.ClampBorder
+                                or border != [1.0, 1.0, 1.0, 1.0] or samp.object != rd.ResourceId()
+                                or not samp.creationTimeConstant):
+                            raise rdtest.TestFailureException(f"Heap Test {test}: embedded sampler is wrong: {samp}")
+
+                        loc = self.controller.GetDescriptorLocations(a.descriptorStore, [r])[0]
+                        if loc.logicalBindName != "Embedded Sampler" or loc.category != rd.DescriptorCategory.Sampler:
+                            raise rdtest.TestFailureException(
+                                f"Heap Test {test}: embedded sampler location is {loc.logicalBindName}")
+                    elif test != 7 and samp.addressU != rd.AddressMode.ClampEdge:
                         raise rdtest.TestFailureException(f"Heap Test {test}: sampler address is {samp.addressU}")
                     res = None
                     typ = a.type
