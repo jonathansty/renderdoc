@@ -52,6 +52,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_direct_heap_access()
 
+        self.check_direct_heap_dynamic()
+
         self.check_heap_buffers()
 
         self.check_heap_rebind()
@@ -1480,6 +1482,115 @@ class VK_Descriptor_Heap(rdtest.TestCase):
         self.check_no_validation("direct heap image dispatch debugging")
 
         rdtest.log.end_section("Direct Heap Image Dispatch")
+
+    def check_direct_heap_dynamic(self):
+        """Dispatch with heap indices computed at runtime: each thread loads the descriptor at
+        base + min(tid, count - 1) and a loop reads base..base+count-1. Only count of the consecutive
+        images may be reported as accessed, and the debugger must read the right descriptor for each
+        dynamic index."""
+        marker = self.find_action("Direct Heap Dynamic Indices:")
+        if marker is None:
+            raise rdtest.TestFailureException("Couldn't find the direct heap dynamic indices marker")
+
+        layout = {}
+        for item in marker.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        img = layout['imgSize']
+        buf = layout['bufSize']
+        samp = layout['sampSize']
+        base = layout['base']
+        count = layout['count']
+
+        Image = rd.DescriptorType.Image
+        RWBuffer = rd.DescriptorType.ReadWriteBuffer
+        Sampler = rd.DescriptorType.Sampler
+
+        rdtest.log.begin_section("Direct Heap Dynamic Dispatch")
+
+        dispatch = self.find_action("Direct Heap Dynamic Dispatch").nextAction
+        if not (dispatch.flags & rd.ActionFlags.Dispatch):
+            raise rdtest.TestFailureException(f"Expected a dispatch after the marker, got {dispatch.customName}")
+
+        self.controller.GetDebugMessages()
+        self.set_event(dispatch.eventId, False)
+
+        # only the first 'count' of the 4 consecutive images are accessed, the last one is not
+        cs = rd.ShaderStage.Compute
+        expected_access = [(cs, Image, 'res', (base + i) * img, f"heapDynTex{i}") for i in range(count)]
+        expected_access.append((cs, RWBuffer, 'res', layout['outBuf'] * buf, "heapDynOut"))
+        expected_access.append((cs, Sampler, 'samp', layout['samp'] * samp, None))
+        self.check_direct_accesses("Dynamic dispatch", expected_access)
+
+        self.check_no_validation("direct heap dynamic dispatch feedback")
+
+        pipe = self.controller.GetVulkanPipelineState()
+        res_heap = pipe.resourceHeap.buffer
+        samp_heap = pipe.samplerHeap.buffer
+
+        resources = {r.name: r.resourceId for r in self.controller.GetResources()}
+
+        # solid colours of the textures, count of 3 means 0..2 are accessed
+        cols = [[0.2, 0.0, 0.0, 1.0], [0.0, 0.4, 0.0, 1.0], [0.0, 0.0, 0.6, 1.0], [0.8, 0.8, 0.0, 1.0]]
+
+        total = [sum(cols[i][c] for i in range(count)) for c in range(4)]
+
+        out_data = self.controller.GetBufferData(resources["heapDynOut"], 0, 128)
+
+        refl = self.controller.GetPipelineState().GetShaderReflection(cs)
+        if not refl.debugInfo.debuggable:
+            raise rdtest.TestFailureException(
+                f"Dynamic direct heap dispatch is not debuggable: {refl.debugInfo.debugStatus}")
+
+        for x in range(4):
+            expected_direct = cols[min(x, count - 1)]
+
+            written = list(struct.unpack_from("4f", out_data, x * 16))
+            if not rdtest.value_compare(written, expected_direct, eps=0.01):
+                raise rdtest.TestFailureException(f"Thread {x} wrote {written}, expected {expected_direct}")
+
+            written_sum = list(struct.unpack_from("4f", out_data, 64 + x * 16))
+            if not rdtest.value_compare(written_sum, total, eps=0.01):
+                raise rdtest.TestFailureException(f"Thread {x} wrote sum {written_sum}, expected {total}")
+
+        rdtest.log.success("Dynamic dispatch output buffer has the expected values")
+
+        # thread 0 and thread 2 index different descriptors. Thread 3 is clamped to the same as thread 2
+        for x in (0, 2, 3):
+            with self.debug_thread((0, 0, 0), (x, 0, 0)) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                expected_direct = cols[min(x, count - 1)]
+
+                idx = self.find_last_source_var(debug.trace, variables, 'idx').value.u32v[0]
+                if idx != base + min(x, count - 1):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} debugged 'idx' is {idx}, expected {base + min(x, count - 1)}")
+
+                direct = list(self.find_last_source_var(debug.trace, variables, 'direct').value.f32v[0:4])
+                if not rdtest.value_compare(direct, expected_direct, eps=0.01):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} debugged 'direct' is {direct}, expected {expected_direct}")
+
+                total_var = list(self.find_last_source_var(debug.trace, variables, 'sum').value.f32v[0:4])
+                if not rdtest.value_compare(total_var, total, eps=0.01):
+                    raise rdtest.TestFailureException(f"Thread {x} debugged 'sum' is {total_var}, expected {total}")
+
+                # the handle variables only hold the last descriptors loaded: the thread's own index, and the
+                # last element the loop read. Neither may be the unused one
+                dbg = {d for d in self.get_direct_heap_vars(variables, res_heap, samp_heap) if d[1] == Image}
+                own = (rd.VarType.ReadOnlyResource, Image, 'res', (base + min(x, count - 1)) * img)
+                last = (rd.VarType.ReadOnlyResource, Image, 'res', (base + count - 1) * img)
+                allowed = {(rd.VarType.ReadOnlyResource, Image, 'res', (base + i) * img) for i in range(count)}
+                if own not in dbg or last not in dbg or not dbg.issubset(allowed):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} image heap variables {sorted(dbg, key=str)} should include {own} and "
+                        f"{last} and be within {sorted(allowed, key=str)}")
+
+                rdtest.log.success(f"Thread {x} debugged in {cycles} cycles, 'direct' = {direct} as expected")
+
+        self.check_no_validation("direct heap dynamic dispatch debugging")
 
     def check_direct_heap_access(self):
         layout_action = self.find_action("Direct Heap Indices:")
