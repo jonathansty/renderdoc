@@ -55,6 +55,9 @@ enum class PointerFlags
   // slot
   DescriptorHeap = 0x20,
   SamplerHeap = 0x40,
+  // set on the storage variables that buffer pointers from the descriptor heaps point to. The
+  // binding array index of those pointers is the byte offset of the descriptor in the heap buffer
+  HeapBuffer = 0x80,
 };
 
 BITMASK_OPERATORS(PointerFlags);
@@ -688,7 +691,7 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
       }
 
       // SPV_KHR_untyped_pointers / SPV_EXT_descriptor_heap: supported only for direct access to
-      // images and samplers in the descriptor heaps. Unsupported uses are checked below
+      // images, samplers and buffers in the descriptor heaps. Unsupported uses are checked below
       case Capability::UntypedPointersKHR:
       case Capability::DescriptorHeapEXT:
       {
@@ -960,8 +963,8 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
     }
   }
 
-  // untyped pointers are only supported for direct access to images and samplers in the descriptor
-  // heaps, so check for anything else
+  // untyped pointers are only supported for direct access to images, samplers and buffers in the
+  // descriptor heaps, so check for anything else
   if(capabilities.find(Capability::UntypedPointersKHR) != capabilities.end() ||
      capabilities.find(Capability::DescriptorHeapEXT) != capabilities.end())
   {
@@ -987,9 +990,7 @@ void Reflector::CheckDebuggable(bool &debuggable, rdcstr &debugStatus) const
           }
           break;
         }
-        // buffers in descriptor heaps aren't supported yet
-        case Op::TypeBufferEXT:
-        case Op::BufferPointerEXT:
+        // other untyped pointer operations aren't supported yet
         case Op::UntypedPtrAccessChainKHR:
         case Op::UntypedInBoundsPtrAccessChainKHR:
         case Op::UntypedArrayLengthKHR:
@@ -1228,6 +1229,30 @@ ShaderDebugTrace *Debugger::BeginDebug(DebugAPIWrapper *api, const ShaderStage s
     {
       active.ids[v.first] = MakeHeapPointer(v.first, dec.builtIn == BuiltIn::SamplerHeapEXT);
     }
+  }
+
+  // buffers in the descriptor heaps are accessed like bound buffers, through a binding that refers
+  // directly to the descriptor in the heap (see GetResourceBindIndex). All of them share the same
+  // storage variable for their type, the descriptor's offset is in the pointer
+  if(!untypedGlobals.empty())
+  {
+    heapUniformBuffer = ShaderVariable();
+    heapUniformBuffer.name = "ResourceHeap";
+    heapUniformBuffer.rows = heapUniformBuffer.columns = 1;
+    heapUniformBuffer.type = VarType::ConstantBlock;
+    heapUniformBuffer.SetBindIndex(
+        ShaderBindIndex(DescriptorCategory::ConstantBlock,
+                        DirectHeapBindIndex | uint32_t(DescriptorType::ConstantBuffer), 0));
+    setPointerFlags(heapUniformBuffer, PointerFlags::HeapBuffer);
+
+    heapStorageBuffer = ShaderVariable();
+    heapStorageBuffer.name = "ResourceHeap";
+    heapStorageBuffer.rows = heapStorageBuffer.columns = 1;
+    heapStorageBuffer.type = VarType::ReadWriteResource;
+    heapStorageBuffer.SetBindIndex(
+        ShaderBindIndex(DescriptorCategory::ReadWriteResource,
+                        DirectHeapBindIndex | uint32_t(DescriptorType::ReadWriteBuffer), 0));
+    setPointerFlags(heapStorageBuffer, PointerFlags::HeapBuffer | PointerFlags::SSBO);
   }
 
   rdcarray<rdcstr> inputSigNames, outputSigNames;
@@ -3497,10 +3522,12 @@ ShaderVariable Debugger::MakeCompositePointer(const ShaderVariable &base, Id id,
     }
     else
     {
-      type = &dataTypes[idTypes[id]];
-
-      RDCASSERT(type->type == DataType::PointerType);
-      type = &dataTypes[type->InnerType()];
+      // untyped pointers (to buffers in descriptor heaps) have no pointee type, the buffer type ID
+      // below is always set for them
+      if(IsTypedPointerId(id))
+        type = &dataTypes[dataTypes[idTypes[id]].InnerType()];
+      else
+        RDCASSERT(getBufferTypeId(base) != rdcspv::Id());
 
       if(isStructArray)
       {
@@ -3735,6 +3762,12 @@ DeviceOpResult Debugger::GetPointerValue(const ShaderVariable &ptr, ShaderVariab
     const ShaderVariable *inner = getPointer(ptr);
     ret = *inner;
     ret.name = ptr.name;
+    // buffers in descriptor heaps refer directly to their descriptor, the same as images
+    if(checkPointerFlags(*inner, PointerFlags::HeapBuffer))
+    {
+      ret.SetDirectAccess(GetHeapBufferAccess(*inner, getBindArrayIndex(ptr)));
+      return DeviceOpResult::Succeeded;
+    }
     // inherit any array index from the pointer
     ShaderBindIndex bind = ret.GetBindIndex();
     bind.arrayElement = getBindArrayIndex(ptr);
@@ -4220,6 +4253,15 @@ ShaderVariable Debugger::ReadHeapPointer(const ShaderVariable &ptr, Id typeId) c
       setTextureType(ret, (DebugAPIWrapper::TextureType)texType);
       break;
     }
+    case DescriptorType::ConstantBuffer:
+    case DescriptorType::ReadWriteBuffer:
+    {
+      // buffers can't be loaded, they're accessed with OpBufferPointerEXT. Display the descriptor
+      ret.type = descType == DescriptorType::ConstantBuffer ? VarType::ConstantBlock
+                                                            : VarType::ReadWriteResource;
+      ret.SetDirectAccess(apiWrapper->GetDescriptorHeapAccess(descType, byteOffset));
+      break;
+    }
     default:
     {
       // anything else can't be loaded yet, display the byte offset in the heap
@@ -4229,6 +4271,77 @@ ShaderVariable Debugger::ReadHeapPointer(const ShaderVariable &ptr, Id typeId) c
     }
   }
 
+  return ret;
+}
+
+bool Debugger::IsHeapBufferPointer(const ShaderVariable &ptr) const
+{
+  if(ptr.type != VarType::GPUPointer || isUndefPointer(ptr) || IsPhysicalPointer(ptr) ||
+     IsHeapPointer(ptr))
+    return false;
+
+  const ShaderVariable *inner = getPointer(ptr);
+  return inner && checkPointerFlags(*inner, PointerFlags::HeapBuffer);
+}
+
+ShaderDirectAccess Debugger::GetHeapBufferAccess(const ShaderVariable &inner, uint32_t byteOffset) const
+{
+  const DescriptorType type = inner.type == VarType::ConstantBlock ? DescriptorType::ConstantBuffer
+                                                                   : DescriptorType::ReadWriteBuffer;
+
+  // the byte offset is already relative to the descriptor store rather than the start of the heap,
+  // so only fetch the store and size
+  ShaderDirectAccess access = apiWrapper->GetDescriptorHeapAccess(type, 0);
+  access.byteOffset = byteOffset;
+  return access;
+}
+
+ShaderVariable Debugger::MakeHeapBufferPointer(Id id, const ShaderVariable &heapPtr, Id resultType) const
+{
+  // the heap pointer points at the buffer descriptor's type. Uniform buffers are in the Uniform
+  // storage class, everything else is a storage buffer
+  DescriptorType descType = GetHeapDescriptorType(getBufferTypeId(heapPtr));
+
+  // untyped pointer types aren't data types
+  auto ptrTypeIt = dataTypes.find(resultType);
+  const DataType *ptrType =
+      ptrTypeIt != dataTypes.end() && ptrTypeIt->second.type == DataType::PointerType
+          ? &ptrTypeIt->second
+          : NULL;
+
+  if(descType != DescriptorType::ConstantBuffer && descType != DescriptorType::ReadWriteBuffer)
+  {
+    descType = DescriptorType::ReadWriteBuffer;
+    if(ptrType && ptrType->pointerType.storage == StorageClass::Uniform)
+      descType = DescriptorType::ConstantBuffer;
+  }
+
+  ShaderVariable ret = MakePointerVariable(
+      id, descType == DescriptorType::ConstantBuffer ? &heapUniformBuffer : &heapStorageBuffer);
+
+  // the binding array index stores the descriptor's byte offset in the descriptor store, which is
+  // what the direct heap binding passed to the API wrapper refers to (see GetResourceBindIndex)
+  ShaderDirectAccess access = apiWrapper->GetDescriptorHeapAccess(descType, getByteOffset(heapPtr));
+  setBindArrayIndex(ret, access.byteOffset);
+  setByteOffset(ret, 0);
+
+  // typed pointers point at the buffer's block type, untyped pointers get their type from the
+  // access chains or loads using them
+  setBufferTypeId(ret, ptrType ? ptrType->InnerType() : Id());
+
+  return ret;
+}
+
+bool Debugger::IsTypedPointerId(Id ssaId) const
+{
+  auto it = dataTypes.find(idTypes[ssaId]);
+  return it != dataTypes.end() && it->second.type == DataType::PointerType;
+}
+
+ShaderVariable Debugger::SetUntypedPointerType(const ShaderVariable &ptr, Id typeId) const
+{
+  ShaderVariable ret = ptr;
+  setBufferTypeId(ret, typeId);
   return ret;
 }
 

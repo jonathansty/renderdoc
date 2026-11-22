@@ -993,6 +993,23 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         break;
       }
 
+      // untyped pointers to buffers in descriptor heaps that haven't been through an access chain
+      // have no pointee type, the load gives it
+      if(debugger.IsHeapBufferPointer(GetSrc(load.pointer)) &&
+         !debugger.IsTypedPointerId(load.pointer))
+      {
+        ShaderVariable val;
+        if(debugger.ReadFromPointer(
+               debugger.SetUntypedPointerType(GetSrc(load.pointer), load.resultType), val) ==
+           DeviceOpResult::NeedsDevice)
+        {
+          SetStepNeedsDeviceThread();
+          break;
+        }
+        SetDst(load.result, val);
+        break;
+      }
+
       // get the pointer value, evaluate it (i.e. dereference) and store the result
       ShaderVariable val;
       if(ReadPointerValue(false, load.pointer, val) == DeviceOpResult::NeedsDevice)
@@ -1079,6 +1096,22 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 
       const ShaderVariable &base = GetSrc(chain.base);
 
+      // untyped access chains into buffers from descriptor heaps (OpBufferPointerEXT) are like
+      // normal buffer access chains, with the base type given in the chain
+      if(debugger.IsHeapBufferPointer(base))
+      {
+        rdcarray<uint32_t> indices;
+        indices.reserve(chain.indexes.size());
+        for(Id id : chain.indexes)
+          indices.push_back(uintComp(GetSrc(id), 0));
+
+        Id baseId = debugger.GetPointerBaseId(base);
+        SetDst(chain.result,
+               debugger.MakeCompositePointer(debugger.SetUntypedPointerType(base, chain.baseType),
+                                             baseId, indices));
+        break;
+      }
+
       // only descriptor heap access chains are supported, other untyped variables are rejected as
       // not debuggable
       if(!debugger.IsHeapPointer(base))
@@ -1105,6 +1138,27 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       }
 
       SetDst(chain.result, debugger.MakeHeapAccessChain(base, chain.baseType, indices));
+      break;
+    }
+    case Op::BufferPointerEXT:
+    {
+      OpBufferPointerEXT bufPtr(it);
+
+      const ShaderVariable &heapPtr = GetSrc(bufPtr.buffer);
+
+      // the buffer operand is a pointer to a buffer descriptor in the resource heap
+      if(!debugger.IsHeapPointer(heapPtr))
+      {
+        debugger.AddDebugMessage(MessageCategory::Execution, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning,
+                                 StringFormat::Fmt("Unsupported buffer pointer from %s",
+                                                   debugger.GetHumanName(bufPtr.buffer).c_str()));
+        SetDst(bufPtr.result, heapPtr);
+        break;
+      }
+
+      SetDst(bufPtr.result,
+             debugger.MakeHeapBufferPointer(bufPtr.result, heapPtr, bufPtr.resultType));
       break;
     }
     case Op::PtrAccessChain:
@@ -1174,7 +1228,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         break;
       }
 
-      ShaderBindIndex bind = val.GetBindIndex();
+      // buffers in descriptor heaps refer directly to their descriptor
+      ShaderBindIndex bind = GetResourceBindIndex(val);
 
       uint64_t bufferLen;
       if(debugger.GetBufferLength(bind, bufferLen) == DeviceOpResult::NeedsDevice)
@@ -5480,7 +5535,6 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::CompositeConstructCoopMatQCOM:
     case Op::CompositeExtractCoopMatQCOM:
     case Op::ExtractSubArrayQCOM:
-    case Op::BufferPointerEXT:
     case Op::UntypedImageTexelPointerEXT:
     case Op::ConstantSizeOfEXT:
     case Op::HitObjectRecordFromQueryEXT:

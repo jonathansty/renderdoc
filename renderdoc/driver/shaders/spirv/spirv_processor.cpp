@@ -765,6 +765,11 @@ void Processor::RegisterOp(Iter it)
     {
       v.type = VarType::Struct;
     }
+    else if(type.type == DataType::ArrayType)
+    {
+      // arrays have no type of their own, the same as arrays constructed in the debugger
+      v.type = VarType::Unknown;
+    }
 
     rdcarray<ShaderVariable> members;
 

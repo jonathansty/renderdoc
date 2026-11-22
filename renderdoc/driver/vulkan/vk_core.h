@@ -1577,6 +1577,10 @@ public:
   bool DescriptorHeaps() const { return m_DescriptorHeaps; }
   // size of a descriptor of the given type in a descriptor heap (VK_EXT_descriptor_heap)
   uint32_t HeapDescriptorSize(VkDescriptorType type);
+  const VkPhysicalDeviceDescriptorHeapPropertiesEXT &GetDescriptorHeapProperties() const
+  {
+    return m_DescriptorHeapProperties;
+  }
   bool DescriptorsInMemory() const { return m_DescriptorBuffers || m_DescriptorHeaps; }
   bool MultiViewGeometryShaders() const { return m_MultiViewGeometryShaders; }
   bool MultiviewPerViewViewports() const { return m_MultiviewPerViewViewports; }

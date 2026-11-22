@@ -279,6 +279,38 @@ public:
       // combined image samplers in the heap are just images
       m_HeapDescriptorSizes[uint32_t(DescriptorType::ImageSampler)] =
           m_HeapDescriptorSizes[uint32_t(DescriptorType::Image)];
+
+      // the size of a descriptor type in the shader (OpConstantSizeOfEXT) is the size for its whole
+      // class, which may be larger than the size of a particular descriptor type. e.g. uniform
+      // buffer descriptors can be smaller than storage buffer descriptors, but OpTypeBufferEXT has
+      // the same size for both.
+      const VkPhysicalDeviceDescriptorHeapPropertiesEXT &props =
+          m_pDriver->GetDescriptorHeapProperties();
+      for(uint32_t type = 0; type < ARRAY_COUNT(m_HeapDescriptorStrides); type++)
+      {
+        switch(DescriptorType(type))
+        {
+          case DescriptorType::Sampler:
+            m_HeapDescriptorStrides[type] = (uint32_t)props.samplerDescriptorSize;
+            break;
+          case DescriptorType::ConstantBuffer:
+          case DescriptorType::ReadWriteBuffer:
+          case DescriptorType::AccelerationStructure:
+            m_HeapDescriptorStrides[type] = (uint32_t)props.bufferDescriptorSize;
+            break;
+          case DescriptorType::ImageSampler:
+          case DescriptorType::Image:
+          case DescriptorType::ReadWriteImage:
+          case DescriptorType::TypedBuffer:
+          case DescriptorType::ReadWriteTypedBuffer:
+            m_HeapDescriptorStrides[type] = (uint32_t)props.imageDescriptorSize;
+            break;
+          default: break;
+        }
+
+        m_HeapDescriptorStrides[type] =
+            RDCMAX(m_HeapDescriptorStrides[type], m_HeapDescriptorSizes[type]);
+      }
     }
 
     RDCASSERT(ShaderDebugData::MAX_QUEUED_OPS * mathOpResultByteSize <
@@ -328,9 +360,9 @@ public:
 
   virtual uint32_t GetDescriptorHeapTypeSize(DescriptorType type) override
   {
-    if(uint32_t(type) >= ARRAY_COUNT(m_HeapDescriptorSizes))
+    if(uint32_t(type) >= ARRAY_COUNT(m_HeapDescriptorStrides))
       return 0;
-    return m_HeapDescriptorSizes[uint32_t(type)];
+    return m_HeapDescriptorStrides[uint32_t(type)];
   }
 
   virtual ShaderDirectAccess GetDescriptorHeapAccess(DescriptorType type,
@@ -344,7 +376,9 @@ public:
 
     // this matches the direct heap accesses returned from GetDescriptorAccess
     return ShaderDirectAccess(type, heap.store, uint32_t(heap.offset + heapByteOffset),
-                              GetDescriptorHeapTypeSize(type));
+                              uint32_t(type) < ARRAY_COUNT(m_HeapDescriptorSizes)
+                                  ? m_HeapDescriptorSizes[uint32_t(type)]
+                                  : 0);
   }
 
   virtual uint64_t GetBufferLength(const ShaderBindIndex &bind) override
@@ -1913,8 +1947,10 @@ private:
     uint64_t offset = 0;
   } m_ResourceHeap, m_SamplerHeap;
 
-  // sizes of descriptors in the heaps, indexed by DescriptorType
+  // sizes of descriptors in the heaps, indexed by DescriptorType. The size of each descriptor type,
+  // and the size of the descriptor class it belongs to in shaders (which may be larger)
   uint32_t m_HeapDescriptorSizes[uint32_t(DescriptorType::AccelerationStructure) + 1] = {};
+  uint32_t m_HeapDescriptorStrides[uint32_t(DescriptorType::AccelerationStructure) + 1] = {};
 
   // descriptors looked up from the heaps on demand, by the direct heap binding from the debugger
   std::map<ShaderBindIndex, Descriptor> m_HeapDescriptors;
@@ -5686,6 +5722,23 @@ VkSpecializationInfo VulkanReplay::MakeSpecInfo(SpecData &specData, VkSpecializa
   return ret;
 }
 
+// shaders on descriptor heap pipelines can be debugged when they access the heaps directly
+// (SPV_EXT_descriptor_heap), but resources mapped from set/binding into the heaps can't be resolved
+// by the debugger yet. Push constants (push data) are fine.
+static bool UsesHeapMappedBindings(WrappedVulkan *driver, const VulkanRenderState &state,
+                                   bool compute, const ShaderReflection &refl)
+{
+  if(!state.UsesDescriptorHeaps(driver, compute))
+    return false;
+
+  for(const ConstantBlock &cb : refl.constantBlocks)
+    if(cb.bufferBacked)
+      return true;
+
+  return !refl.readOnlyResources.empty() || !refl.readWriteResources.empty() ||
+         !refl.samplers.empty();
+}
+
 ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
                                             uint32_t idx, uint32_t view)
 {
@@ -5718,13 +5771,6 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
   // get ourselves in pristine state before this action (without any side effects it may have had)
   m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
 
-  // TODO(heap slice 2): descriptors are not resolvable for descriptor heap shaders yet
-  if(state.UsesDescriptorHeaps(m_pDriver, false))
-  {
-    RDCWARN("Vertex debugging is not supported with descriptor heaps");
-    return new ShaderDebugTrace();
-  }
-
   const VulkanCreationInfo::Pipeline &pipe = c.m_Pipeline[state.graphics.pipeline];
   const VulkanCreationInfo::ShaderEntry &shaderEntry =
       state.graphics.shaderObject ? c.m_ShaderObject[state.shaderObjects[0]].shad : pipe.shaders[0];
@@ -5738,6 +5784,13 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
   if(!shadRefl.refl->debugInfo.debuggable)
   {
     RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
+    return new ShaderDebugTrace();
+  }
+
+  // TODO(heap): resources mapped from set/binding into descriptor heaps
+  if(UsesHeapMappedBindings(m_pDriver, state, false, *shadRefl.refl))
+  {
+    RDCWARN("Vertex debugging is not supported with set/binding mapped descriptor heap resources");
     return new ShaderDebugTrace();
   }
 
@@ -6273,13 +6326,6 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
   // get ourselves in pristine state before this action (without any side effects it may have had)
   m_pDriver->ReplayLog(0, eventId, eReplay_WithoutDraw);
 
-  // TODO(heap slice 2): descriptors are not resolvable for descriptor heap shaders yet
-  if(state.UsesDescriptorHeaps(m_pDriver, false))
-  {
-    RDCWARN("Pixel debugging is not supported with descriptor heaps");
-    return new ShaderDebugTrace();
-  }
-
   const VulkanCreationInfo::ShaderEntry &fragEntry =
       state.graphics.shaderObject ? c.m_ShaderObject[state.shaderObjects[4]].shad : pipe.shaders[4];
   VulkanCreationInfo::ShaderModule &shader = c.m_ShaderModule[fragEntry.module];
@@ -6292,6 +6338,13 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
   if(!shadRefl.refl->debugInfo.debuggable)
   {
     RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
+    return new ShaderDebugTrace();
+  }
+
+  // TODO(heap): resources mapped from set/binding into descriptor heaps
+  if(UsesHeapMappedBindings(m_pDriver, state, false, *shadRefl.refl))
+  {
+    RDCWARN("Pixel debugging is not supported with set/binding mapped descriptor heap resources");
     return new ShaderDebugTrace();
   }
 
@@ -6857,7 +6910,7 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   // compute shaders using descriptor heaps can be debugged, task/mesh shaders not yet
   if(stage != ShaderStage::Compute && state.UsesDescriptorHeaps(m_pDriver, false))
   {
-    // TODO(heap slice 3.2): task/mesh shader debugging with descriptor heaps
+    // TODO(heap): task/mesh shader debugging with descriptor heaps (untested, no demo coverage)
     RDCWARN("%s debugging is not supported with descriptor heaps", ToStr(stage).c_str());
     return new ShaderDebugTrace();
   }
@@ -6878,6 +6931,14 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   if(!shadRefl.refl->debugInfo.debuggable)
   {
     RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
+    return new ShaderDebugTrace();
+  }
+
+  // TODO(heap): resources mapped from set/binding into descriptor heaps
+  if(UsesHeapMappedBindings(m_pDriver, state, stage == ShaderStage::Compute, *shadRefl.refl))
+  {
+    RDCWARN("%s debugging is not supported with set/binding mapped descriptor heap resources",
+            ToStr(stage).c_str());
     return new ShaderDebugTrace();
   }
 

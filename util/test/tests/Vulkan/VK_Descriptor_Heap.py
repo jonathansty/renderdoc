@@ -108,6 +108,16 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
             rdtest.log.success(f"Heap Test {test} output is as expected")
 
+            # resources mapped from set/binding into the heaps can't be resolved by the shader debugger
+            # yet, so pixel debugging must be refused rather than producing wrong results
+            fx, fy, _ = checks[0]
+            trace = self.controller.DebugPixel(int(v.x + v.width * fx), int(v.y + v.height * fy),
+                                               rd.DebugPixelInputs())
+            if trace.debugger is not None:
+                self.controller.FreeTrace(trace)
+                raise rdtest.TestFailureException(f"Heap Test {test} pixel debugging should not be supported")
+            self.controller.FreeTrace(trace)
+
             rdtest.log.end_section(f"Heap Test {test}")
 
     def check_heap_descriptors(self):
@@ -278,6 +288,198 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         return access
 
+    def find_last_source_var(self, trace, variables, name):
+        """Evaluate the last value of the named source variable in a processed debug trace."""
+        count = len(trace.instInfo)
+        for inst in range(count):
+            source_vars = [sv for sv in trace.instInfo[count - 1 - inst].sourceVars if sv.name == name]
+            if len(source_vars) == 0:
+                continue
+            try:
+                return self.evaluate_source_var(source_vars[0], variables)
+            except KeyError:
+                continue
+            except rdtest.TestFailureException:
+                continue
+
+        raise rdtest.TestFailureException(f"Couldn't find source variable '{name}'")
+
+    def get_direct_heap_vars(self, variables, res_heap, samp_heap):
+        """Get the set of (var type, descriptor type, heap, byte offset) for all debugger variables that
+        refer directly to descriptors in the heaps."""
+        direct = set()
+        for var in variables.values():
+            if var.type in (rd.VarType.ReadOnlyResource, rd.VarType.ReadWriteResource, rd.VarType.Sampler,
+                            rd.VarType.ConstantBlock) and var.IsDirectAccess():
+                acc = var.GetDirectAccess()
+                heap = 'res' if acc.descriptorStore == res_heap else (
+                    'samp' if acc.descriptorStore == samp_heap else str(acc.descriptorStore))
+                direct.add((var.type, acc.type, heap, acc.byteOffset))
+        return direct
+
+    def check_direct_heap_buffer_debug(self, layout):
+        """Debug threads of the direct heap dispatch, which reads a structured buffer, a constant buffer and
+        a texture and writes to a structured buffer, a byte address buffer (atomically) and a storage image,
+        all accessed directly from the heaps. Check the debugger calculates the same values as the dispatch
+        wrote."""
+        buf = layout['bufSize']
+
+        RWBuffer = rd.DescriptorType.ReadWriteBuffer
+        CBuffer = rd.DescriptorType.ConstantBuffer
+
+        pipe = self.controller.GetVulkanPipelineState()
+        res_heap = pipe.resourceHeap.buffer
+        samp_heap = pipe.samplerHeap.buffer
+
+        cs = rd.ShaderStage.Compute
+        refl = self.controller.GetPipelineState().GetShaderReflection(cs)
+        if not refl.debugInfo.debuggable:
+            raise rdtest.TestFailureException(
+                f"Direct heap dispatch is not debuggable: {refl.debugInfo.debugStatus}")
+
+        resources = {r.name: r.resourceId for r in self.controller.GetResources()}
+
+        # each thread writes (texture + inBuf[x % 2]) * scale + bias * x to outBuf[x]
+        tex = [1.0, 1.0, 0.0, 1.0]
+        in_buf = [[1.0, 0.5, 1.0, 1.0], [0.5, 0.5, 0.0, 0.0]]
+        scale = [1.0, 1.0, 1.0, 0.5]
+        bias = [0.25, 0.0, 0.5, 0.0]
+
+        out_data = self.controller.GetBufferData(resources["directOutBuf"], 0, 64)
+
+        # the counter is never reset, so it's incremented by 4 every frame. Each thread gets the value
+        # from before the dispatch plus the number of threads that incremented it before
+        counter = struct.unpack_from("I", self.controller.GetBufferData(resources["directCounterBuf"], 0, 4), 0)[0]
+        if counter < 4 or (counter % 4) != 0:
+            raise rdtest.TestFailureException(f"Direct heap dispatch counter is {counter}, expected a multiple of 4")
+
+        dim = refl.dispatchThreadsDimension
+        if list(dim) != [4, 1, 1]:
+            raise rdtest.TestFailureException(f"Unexpected direct heap dispatch thread dimension {list(dim)}")
+
+        for x in range(4):
+            expected = [(tex[c] + in_buf[x % 2][c]) * scale[c] + bias[c] * x for c in range(4)]
+
+            written = list(struct.unpack_from("4f", out_data, x * 16))
+            if not rdtest.value_compare(written, expected, eps=0.01):
+                raise rdtest.TestFailureException(f"Thread {x} wrote {written} to the output, expected {expected}")
+
+            with self.debug_thread((0, 0, 0), (x, 0, 0)) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                col = list(self.find_last_source_var(debug.trace, variables, 'col').value.f32v[0:4])
+                if not rdtest.value_compare(col, written, eps=1.0E-5):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} debugged 'col' is {col}, the dispatch wrote {written}")
+
+                # the structured buffer is 0x100 bytes of float4s
+                count = self.find_last_source_var(debug.trace, variables, 'count').value.u32v[0]
+                if count != 0x100 // 16:
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} debugged 'count' is {count}, expected {0x100 // 16}")
+
+                # the counter is incremented atomically by every thread. The debugger starts from the
+                # value before the dispatch, but other threads may or may not have been simulated
+                prev = self.find_last_source_var(debug.trace, variables, 'prev').value.u32v[0]
+                if prev < counter - 4 or prev >= counter:
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} debugged 'prev' is {prev}, expected in [{counter - 4}, {counter})")
+
+                # the buffers should refer directly to the descriptors in the heap, the same as the direct
+                # accesses from feedback
+                direct = self.get_direct_heap_vars(variables, res_heap, samp_heap)
+                expected_direct = {
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['buf'] * buf),
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['outBuf'] * buf),
+                    (rd.VarType.ReadWriteResource, RWBuffer, 'res', layout['counterBuf'] * buf),
+                    (rd.VarType.ConstantBlock, CBuffer, 'res', layout['constBuf'] * buf),
+                }
+                if not expected_direct.issubset(direct):
+                    raise rdtest.TestFailureException(
+                        f"Thread {x} heap descriptor variables {sorted(direct, key=str)} don't include "
+                        f"{sorted(expected_direct, key=str)}")
+
+                rdtest.log.success(f"Thread {x} debugged in {cycles} cycles, 'col' = {col} as expected")
+
+        self.check_no_validation("direct heap dispatch debugging")
+
+    def check_direct_heap_draw_debug(self, layout):
+        """Debug vertices and pixels of the direct heap draw, which read a structured buffer from the heap
+        in both stages and sample a texture in the pixel shader."""
+        buf = layout['bufSize']
+        img = layout['imgSize']
+        samp = layout['sampSize']
+
+        pipe = self.controller.GetVulkanPipelineState()
+        res_heap = pipe.resourceHeap.buffer
+        samp_heap = pipe.samplerHeap.buffer
+
+        for stage in (rd.ShaderStage.Vertex, rd.ShaderStage.Pixel):
+            refl = self.controller.GetPipelineState().GetShaderReflection(stage)
+            if not refl.debugInfo.debuggable:
+                raise rdtest.TestFailureException(
+                    f"Direct heap draw {stage} is not debuggable: {refl.debugInfo.debugStatus}")
+
+        # the vertex shader generates a quad from the vertex index, scaled by buf[1].xy = (0.5, 0.5)
+        positions = [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]
+
+        for vtx in range(4):
+            with self.debug_vertex(vtx, 0, vtx, 0) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                px, py = positions[vtx]
+                expected_pos = [px * 0.5, py * 0.5, 0.0, 1.0]
+                expected_uv = [px * 0.5 + 0.5, py * 0.5 + 0.5]
+
+                # the position output has no source variable of its own, check the returned struct
+                pos = list(self.find_last_source_var(debug.trace, variables, 'ret.pos').value.f32v[0:4])
+                uv = list(self.find_last_source_var(debug.trace, variables, 'ret.uv').value.f32v[0:2])
+                uv_var = self.find_output_source_var(debug.trace, rd.ShaderBuiltin.Undefined, 0)
+                uv_out = list(self.evaluate_source_var(uv_var, variables).value.f32v[0:2])
+                if uv_out != uv:
+                    raise rdtest.TestFailureException(f"Vertex {vtx} uv output {uv_out} doesn't match 'ret.uv' {uv}")
+
+                if not rdtest.value_compare(pos, expected_pos, eps=1.0E-5) or not rdtest.value_compare(
+                        uv, expected_uv, eps=1.0E-5):
+                    raise rdtest.TestFailureException(
+                        f"Vertex {vtx} debugged position {pos} uv {uv}, expected {expected_pos} {expected_uv}")
+
+                direct = self.get_direct_heap_vars(variables, res_heap, samp_heap)
+                expected_direct = (rd.VarType.ReadWriteResource, rd.DescriptorType.ReadWriteBuffer, 'res',
+                                   layout['buf'] * buf)
+                if expected_direct not in direct:
+                    raise rdtest.TestFailureException(
+                        f"Vertex {vtx} heap descriptor variables {sorted(direct, key=str)} don't include "
+                        f"{expected_direct}")
+
+                rdtest.log.success(f"Vertex {vtx} debugged in {cycles} cycles, position {pos} as expected")
+
+        v = self.controller.GetPipelineState().GetViewport(0)
+
+        # the quad covers the middle half of the viewport
+        for fx, fy in [(0.5, 0.5), (0.3, 0.6), (0.7, 0.3)]:
+            x = int(v.x + v.width * fx)
+            y = int(v.y + v.height * fy)
+
+            # compares the debugged output against the real output
+            self.check_debug_pixel(x, y)
+
+            with self.debug_pixel(x, y, rd.DebugPixelInputs()) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                direct = self.get_direct_heap_vars(variables, res_heap, samp_heap)
+                expected_direct = {
+                    (rd.VarType.ReadWriteResource, rd.DescriptorType.ReadWriteBuffer, 'res', layout['buf'] * buf),
+                    (rd.VarType.ReadOnlyResource, rd.DescriptorType.Image, 'res', layout['tex'] * img),
+                    (rd.VarType.Sampler, rd.DescriptorType.Sampler, 'samp', layout['samp'] * samp),
+                }
+                if not expected_direct.issubset(direct):
+                    raise rdtest.TestFailureException(
+                        f"Pixel {x},{y} heap descriptor variables {sorted(direct, key=str)} don't include "
+                        f"{sorted(expected_direct, key=str)}")
+
+        self.check_no_validation("direct heap draw debugging")
+
     def check_direct_heap_image_debug(self, layout):
         """Debug threads of the image-only direct heap dispatch, which samples a texture with a sampler
         and writes to a storage image all accessed directly from the heaps, and check the debugger
@@ -405,6 +607,7 @@ class VK_Descriptor_Heap(rdtest.TestCase):
         Image = rd.DescriptorType.Image
         RWImage = rd.DescriptorType.ReadWriteImage
         RWBuffer = rd.DescriptorType.ReadWriteBuffer
+        CBuffer = rd.DescriptorType.ConstantBuffer
         Sampler = rd.DescriptorType.Sampler
 
         # compute dispatch
@@ -423,10 +626,19 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             (cs, RWImage, 'res', layout['outTex'] * img, "directOutTex"),
             (cs, RWBuffer, 'res', layout['buf'] * buf, "directBuf"),
             (cs, RWBuffer, 'res', layout['outBuf'] * buf, "directOutBuf"),
+            (cs, RWBuffer, 'res', layout['counterBuf'] * buf, "directCounterBuf"),
+            (cs, CBuffer, 'res', layout['constBuf'] * buf, "directConstBuf"),
             (cs, Sampler, 'samp', layout['samp'] * samp, None),
         ])
 
         for a in access:
+            # uniform buffer descriptors can be smaller than the maximum buffer descriptor size
+            if a.type == CBuffer:
+                if a.byteSize == 0 or a.byteSize > buf:
+                    raise rdtest.TestFailureException(
+                        f"Direct heap access {a.type} has byteSize {a.byteSize}, expected at most {buf}")
+                continue
+
             expected_size = samp if a.type == Sampler else (buf if a.type == RWBuffer else img)
             if a.byteSize != expected_size:
                 raise rdtest.TestFailureException(
@@ -434,23 +646,15 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_no_validation("direct heap dispatch feedback")
 
-        # the dispatch output is texture + buffer colour
+        # the first thread's output is (texture + buffer colour) * scale
         out_buf = [r for r in self.controller.GetResources() if r.name == "directOutBuf"][0].resourceId
         data = struct.unpack_from("4f", self.controller.GetBufferData(out_buf, 0, 16), 0)
-        if not rdtest.value_compare(list(data), [2.0, 1.5, 1.0, 2.0], eps=0.02):
+        if not rdtest.value_compare(list(data), [2.0, 1.5, 1.0, 1.0], eps=0.02):
             raise rdtest.TestFailureException(f"Direct heap dispatch output is {list(data)}")
 
         rdtest.log.success("Direct heap dispatch output is as expected")
 
-        # this shader accesses buffers in the heap, which can't be debugged yet. It must be reported as
-        # not debuggable rather than failing
-        refl = self.controller.GetPipelineState().GetShaderReflection(cs)
-        if refl.debugInfo.debuggable or 'TypeBufferEXT' not in refl.debugInfo.debugStatus:
-            raise rdtest.TestFailureException(
-                f"Direct heap dispatch with buffers should not be debuggable, got "
-                f"{refl.debugInfo.debuggable} '{refl.debugInfo.debugStatus}'")
-
-        rdtest.log.success(f"Direct heap dispatch is not debuggable: {refl.debugInfo.debugStatus}")
+        self.check_direct_heap_buffer_debug(layout)
 
         rdtest.log.end_section("Direct Heap Dispatch")
 
@@ -485,5 +689,7 @@ class VK_Descriptor_Heap(rdtest.TestCase):
                                eps=0.02)
 
         rdtest.log.success("Direct heap draw output is as expected")
+
+        self.check_direct_heap_draw_debug(layout)
 
         rdtest.log.end_section("Direct Heap Draw")
