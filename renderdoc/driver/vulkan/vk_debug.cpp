@@ -3445,13 +3445,21 @@ VulkanReplay::AddedDescriptorData VulkanReplay::PrepareExtraBufferDescriptor(
   const VulkanStatePipeline &srcPipeState = compute ? state.compute : state.graphics;
   const VulkanCreationInfo::Pipeline &pipe = c.m_Pipeline[srcPipeState.pipeline];
 
-  if(IsBinding(m_StorageMode) && state.UsesDescriptorHeaps(m_pDriver, compute))
+  const bool usesHeaps = state.UsesDescriptorHeaps(m_pDriver, compute);
+
+  if(IsBinding(m_StorageMode) && usesHeaps)
   {
     // heap pipelines have no pipeline layout or descriptor sets we could add our own to, so they
     // can only be patched with buffer addresses
     RDCERR("Can't patch descriptor heap shaders without buffer device address");
     return {};
   }
+
+  // heap pipelines have no layout at all - push data and the bound heaps are visible to every stage
+  // so a vertex shader patched to compute needs nothing extra and the pipeline is created with no
+  // layout
+  if(usesHeaps)
+    return ret;
 
   if(IsBinding(m_StorageMode))
   {

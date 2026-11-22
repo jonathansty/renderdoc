@@ -94,6 +94,23 @@ enum class BuiltinShaderTextureType
 
 ITERABLE_OPERATORS(BuiltinShaderTextureType);
 
+// owns the storage for re-chaining a VkShaderDescriptorSetAndBindingMappingInfoEXT from the stored
+// descriptor mappings of a shader. The returned struct points into this object's storage so it must
+// outlive any create info it's chained into
+struct DescriptorMappingChain
+{
+  rdcarray<VkDescriptorSetAndBindingMappingEXT> mappings;
+  rdcarray<VkSamplerCreateInfo> samplers;
+  rdcarray<VkSamplerCustomBorderColorCreateInfoEXT> borders;
+  rdcarray<VkSamplerYcbcrConversionInfo> ycbcrs;
+  VkShaderDescriptorSetAndBindingMappingInfoEXT info;
+
+  // returns NULL if the shader has no mappings, otherwise the struct to add to a pNext chain. The
+  // caller is responsible for setting info.pNext
+  VkShaderDescriptorSetAndBindingMappingInfoEXT *Build(VulkanResourceManager *rm,
+                                                       const VulkanCreationInfo::ShaderEntry &shad);
+};
+
 class VulkanShaderCache
 {
 public:

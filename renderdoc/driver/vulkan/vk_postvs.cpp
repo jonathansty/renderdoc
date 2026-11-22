@@ -148,14 +148,16 @@ static void ConvertToMeshOutputCompute(const ShaderReflection &refl, const SPIRV
       // remove any builtin decorations
       if(decorate.decoration == rdcspv::Decoration::BuiltIn)
       {
-        // subgroup builtins can be allowed to stay
+        // subgroup builtins and descriptor heap variables can be allowed to stay
         if(decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupEqMask ||
            decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupGtMask ||
            decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupGeMask ||
            decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupLtMask ||
            decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupLeMask ||
            decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupLocalInvocationId ||
-           decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupSize)
+           decorate.decoration.builtIn == rdcspv::BuiltIn::SubgroupSize ||
+           decorate.decoration.builtIn == rdcspv::BuiltIn::ResourceHeapEXT ||
+           decorate.decoration.builtIn == rdcspv::BuiltIn::SamplerHeapEXT)
         {
           builtinKeeps.insert(decorate.target);
           continue;
@@ -4459,6 +4461,18 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   // make copy of state to draw from
   VulkanRenderState modifiedstate = state;
 
+  // descriptor heap pipelines have no layout or descriptor sets, the patched compute shader reads
+  // the same bound heaps and push data. Our own buffers can only be passed by address
+  const bool usesHeaps = state.UsesDescriptorHeaps(m_pDriver, false);
+
+  if(usesHeaps && !IsBDA(m_StorageMode))
+  {
+    ret.vsout.status =
+        "Mesh output with descriptor heaps requires buffer device address support for patching";
+    RDCERR("%s", ret.vsout.status.c_str());
+    return;
+  }
+
   AddedDescriptorData patchedBufferdata =
       PrepareExtraBufferDescriptor(modifiedstate, false, newBindings, true);
 
@@ -4471,7 +4485,7 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   // we should always get a new pipeline layout when we're doing vertex-to-compute, since even if we
   // don't change set layouts we might need to fiddle with push constants (and we don't skip the new
   // layout create if there are no push ranges)
-  RDCASSERT(patchedBufferdata.pipeLayout != VK_NULL_HANDLE);
+  RDCASSERT(usesHeaps || patchedBufferdata.pipeLayout != VK_NULL_HANDLE);
 
   VkBuffer meshBuffer = VK_NULL_HANDLE, readbackBuffer = VK_NULL_HANDLE;
   VkDeviceMemory meshMem = VK_NULL_HANDLE, readbackMem = VK_NULL_HANDLE;
@@ -5390,6 +5404,15 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   if(pipeCreateInfo.flags & VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT)
     compPipeInfo.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
+  // heap pipelines have no layout and can only be declared via flags2
+  VkPipelineCreateFlags2CreateInfo heapFlags = {VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO};
+  if(usesHeaps)
+  {
+    compPipeInfo.layout = VK_NULL_HANDLE;
+    heapFlags.flags = VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+    compPipeInfo.pNext = &heapFlags;
+  }
+
   // create vertex shader with modified code
   VkShaderModuleCreateInfo moduleCreateInfo = {
       VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL,         0,
@@ -5404,6 +5427,12 @@ void VulkanReplay::FetchVSOut(uint32_t eventId, VulkanRenderState &state)
   compPipeInfo.stage.module = module;
   compPipeInfo.stage.pName = PatchedMeshOutputEntryPoint;
   compPipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+
+  // set/binding mapped resources in the vertex shader map the same way from compute - the mappings
+  // aren't stage specific
+  DescriptorMappingChain heapMapping;
+  if(usesHeaps)
+    compPipeInfo.stage.pNext = heapMapping.Build(GetResourceManager(), vertShad);
 
   // append our own specialisation constants if we're using BDA
   if(IsBDA(m_StorageMode))
@@ -6317,13 +6346,7 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
     return;
   }
 
-  if(state.UsesDescriptorHeaps(m_pDriver, false))
-  {
-    // TODO(heap slice 3): shader patching is not supported for descriptor heap shaders yet
-    RDCWARN("Post-VS data is not supported with descriptor heaps, event %u", eventId);
-    ret.gsout.status = ret.vsout.status = "Mesh output is not supported with descriptor heaps";
-    return;
-  }
+  const bool usesHeaps = state.UsesDescriptorHeaps(m_pDriver, false);
 
   const VulkanCreationInfo::Pipeline &pipeInfo = creationInfo.m_Pipeline[state.graphics.pipeline];
 
@@ -6352,6 +6375,15 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
 
   if(action->flags & ActionFlags::MeshDispatch)
   {
+    if(usesHeaps)
+    {
+      // TODO(heap): task/mesh shader output with descriptor heaps (no demo coverage yet)
+      RDCWARN("Mesh shader output is not supported with descriptor heaps, event %u", eventId);
+      ret.gsout.status = ret.vsout.status =
+          "Mesh shader output is not supported with descriptor heaps";
+      return;
+    }
+
     FetchMeshOut(eventId, state);
     return;
   }
@@ -6387,6 +6419,15 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
   if(noTessGS)
   {
     ret.gsout.status = "No geometry and no tessellation shader bound.";
+    return;
+  }
+
+  if(usesHeaps)
+  {
+    // TODO(heap): transform feedback of tessellation/geometry output with descriptor heaps (no demo
+    // coverage yet)
+    ret.gsout.status =
+        "Tessellation/geometry shader output is not supported with descriptor heaps";
     return;
   }
 

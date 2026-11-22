@@ -48,6 +48,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_heap_buffers()
 
+        self.check_heap_mesh_output()
+
         eid = 0
 
         for test, checks in enumerate(expected):
@@ -121,6 +123,51 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             self.controller.FreeTrace(trace)
 
             rdtest.log.end_section(f"Heap Test {test}")
+
+    def check_heap_mesh_output(self):
+        """The mesh viewer's VS Out data for graphics pipelines that use descriptor heaps"""
+        def quad(positions, scale, posname, uvname):
+            ref = {}
+            for i, p in enumerate(positions):
+                ref[i] = {'vtx': i, 'idx': i, posname: [p[0] * scale, p[1] * scale, 0.0, 1.0],
+                          uvname: [p[0] * 0.5 + 0.5, p[1] * 0.5 + 0.5]}
+            return ref
+
+        tests = [
+            # GLSL vertex shader, descriptors via set/binding mappings
+            ("Heap Test 0", quad([(-1, 1), (1, 1), (-1, -1), (1, -1)], 1.0, 'gl_Position', 'uv')),
+            # Slang vertex shader reading a heap buffer directly
+            ("Direct Heap Draw", quad([(-1, -1), (1, -1), (-1, 1), (1, 1)], 0.5, '_Position', 'entryPointParam_vsmain.uv')),
+            # vertex pulling from a structured buffer in the heap
+            ("Heap Buffer Draw", {
+                0: {'vtx': 0, 'idx': 0, '_Position': [-0.8, 0.8, 0.0, 1.0], 'entryPointParam_vsmain.col': [1.0, 0.0, 0.0, 1.0],
+                    'entryPointParam_vsmain.uv': [0.0, 0.0]},
+                1: {'vtx': 1, 'idx': 1, '_Position': [0.8, 0.8, 0.0, 1.0], 'entryPointParam_vsmain.col': [0.0, 1.0, 0.0, 1.0],
+                    'entryPointParam_vsmain.uv': [1.0, 0.0]},
+                2: {'vtx': 2, 'idx': 2, '_Position': [0.0, -0.8, 0.0, 1.0], 'entryPointParam_vsmain.col': [0.0, 0.0, 1.0, 1.0],
+                    'entryPointParam_vsmain.uv': [0.5, 1.0]},
+            }),
+        ]
+
+        for marker, ref in tests:
+            rdtest.log.begin_section(f"{marker} VS Out")
+
+            action = self.find_action(marker)
+            if action is None:
+                raise rdtest.TestFailureException(f"Couldn't find marker {marker}")
+
+            self.controller.GetDebugMessages()
+            self.set_event(action.nextAction.eventId, False)
+
+            postvs = self.get_postvs(action.nextAction, rd.MeshDataStage.VSOut)
+            if not postvs:
+                raise rdtest.TestFailureException(f"No VS Out data for {marker}")
+
+            self.check_mesh_data(ref, postvs)
+
+            self.check_no_validation(f"{marker} VS Out")
+
+            rdtest.log.end_section(f"{marker} VS Out")
 
     def check_heap_descriptors(self):
         # the demo reports the layout of the heaps in a marker

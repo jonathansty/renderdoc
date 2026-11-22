@@ -597,73 +597,59 @@ void VulkanShaderCache::SetPipeCacheBlob(bytebuf &blob)
   m_ShaderCacheDirty = true;
 }
 
-// owns the storage for re-chaining a VkShaderDescriptorSetAndBindingMappingInfoEXT from the stored
-// descriptor mappings of a shader. Used with static instances as with the other create info
-// helpers here, as the create info we return must stay valid after the function returns
-struct DescriptorMappingChain
+VkShaderDescriptorSetAndBindingMappingInfoEXT *DescriptorMappingChain::Build(
+    VulkanResourceManager *rm, const VulkanCreationInfo::ShaderEntry &shad)
 {
-  rdcarray<VkDescriptorSetAndBindingMappingEXT> mappings;
-  rdcarray<VkSamplerCreateInfo> samplers;
-  rdcarray<VkSamplerCustomBorderColorCreateInfoEXT> borders;
-  rdcarray<VkSamplerYcbcrConversionInfo> ycbcrs;
-  VkShaderDescriptorSetAndBindingMappingInfoEXT info;
+  if(shad.descriptorMappings.empty())
+    return NULL;
 
-  // returns NULL if the shader has no mappings, otherwise the struct to add to a pNext chain. The
-  // caller is responsible for setting info.pNext
-  VkShaderDescriptorSetAndBindingMappingInfoEXT *Build(
-      VulkanResourceManager *rm, const VulkanCreationInfo::ShaderEntry &shad)
+  const size_t count = shad.descriptorMappings.size();
+
+  // size everything up front so that pointers into the arrays stay valid
+  mappings.resize(count);
+  samplers.resize(count);
+  borders.resize(count);
+  ycbcrs.resize(count);
+
+  for(size_t i = 0; i < count; i++)
   {
-    if(shad.descriptorMappings.empty())
-      return NULL;
+    const VulkanCreationInfo::ShaderEntry::DescriptorMapping &src = shad.descriptorMappings[i];
 
-    const size_t count = shad.descriptorMappings.size();
+    mappings[i] = src.mapping;
+    mappings[i].pNext = NULL;
 
-    // size everything up front so that pointers into the arrays stay valid
-    mappings.resize(count);
-    samplers.resize(count);
-    borders.resize(count);
-    ycbcrs.resize(count);
+    if(!src.hasEmbeddedSampler)
+      continue;
 
-    for(size_t i = 0; i < count; i++)
+    samplers[i] = src.sampler;
+    samplers[i].pNext = NULL;
+
+    if(src.hasBorderColor)
     {
-      const VulkanCreationInfo::ShaderEntry::DescriptorMapping &src = shad.descriptorMappings[i];
-
-      mappings[i] = src.mapping;
-      mappings[i].pNext = NULL;
-
-      if(!src.hasEmbeddedSampler)
-        continue;
-
-      samplers[i] = src.sampler;
-      samplers[i].pNext = NULL;
-
-      if(src.hasBorderColor)
-      {
-        borders[i] = src.borderColor;
-        borders[i].pNext = samplers[i].pNext;
-        samplers[i].pNext = &borders[i];
-      }
-
-      if(src.ycbcr != ResourceId())
-      {
-        ycbcrs[i] = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
-        ycbcrs[i].conversion = rm->GetHandle<VkSamplerYcbcrConversion>(src.ycbcr);
-        ycbcrs[i].pNext = samplers[i].pNext;
-        samplers[i].pNext = &ycbcrs[i];
-      }
-
-      const VkSamplerCreateInfo **embedded = GetDescriptorMappingEmbeddedSampler(mappings[i]);
-      if(embedded)
-        *embedded = &samplers[i];
+      borders[i] = src.borderColor;
+      borders[i].pNext = samplers[i].pNext;
+      samplers[i].pNext = &borders[i];
     }
 
-    info = {VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
-    info.mappingCount = (uint32_t)count;
-    info.pMappings = mappings.data();
+    if(src.ycbcr != ResourceId())
+    {
+      ycbcrs[i] = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
+      ycbcrs[i].conversion = rm->GetHandle<VkSamplerYcbcrConversion>(src.ycbcr);
+      ycbcrs[i].pNext = samplers[i].pNext;
+      samplers[i].pNext = &ycbcrs[i];
+    }
 
-    return &info;
+    const VkSamplerCreateInfo **embedded = GetDescriptorMappingEmbeddedSampler(mappings[i]);
+    if(embedded)
+      *embedded = &samplers[i];
   }
-};
+
+  info = {VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT};
+  info.mappingCount = (uint32_t)count;
+  info.pMappings = mappings.data();
+
+  return &info;
+}
 
 void VulkanShaderCache::MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &pipeCreateInfo,
                                                  ResourceId pipeline)
