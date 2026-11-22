@@ -13,6 +13,9 @@
     <ClCompile Include="vk_resources.cpp">
       <Filter>Util</Filter>
     </ClCompile>
+    <ClCompile Include="vk_heap_mapping.cpp">
+      <Filter>Util</Filter>
+    </ClCompile>
     <ClCompile Include="vk_info.cpp">
       <Filter>Util</Filter>
     </ClCompile>
@@ -163,6 +166,9 @@
       <Filter>Replay</Filter>
     </ClInclude>
     <ClInclude Include="vk_resources.h">
+      <Filter>Util</Filter>
+    </ClInclude>
+    <ClInclude Include="vk_heap_mapping.h">
       <Filter>Util</Filter>
     </ClInclude>
     <ClInclude Include="vk_info.h">

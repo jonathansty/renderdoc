@@ -133,6 +133,7 @@
     <ClCompile Include="vk_common.cpp" />
     <ClCompile Include="vk_core.cpp" />
     <ClCompile Include="vk_debug.cpp" />
+    <ClCompile Include="vk_heap_mapping.cpp" />
     <ClCompile Include="vk_info.cpp" />
     <ClCompile Include="vk_manager.cpp" />
     <ClCompile Include="vk_pixelhistory.cpp" />
@@ -186,6 +187,7 @@
     <ClInclude Include="vk_dispatchtables.h" />
     <ClInclude Include="vk_dispatch_defs.h" />
     <ClInclude Include="vk_hookset_defs.h" />
+    <ClInclude Include="vk_heap_mapping.h" />
     <ClInclude Include="vk_info.h" />
     <ClInclude Include="vk_manager.h" />
     <ClInclude Include="vk_rendertext.h" />

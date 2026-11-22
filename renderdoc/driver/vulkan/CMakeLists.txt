@@ -24,6 +24,8 @@ set(sources
     vk_hookset_defs.h
     vk_image_states.cpp
     vk_info.cpp
+    vk_heap_mapping.cpp
+    vk_heap_mapping.h
     vk_info.h
     vk_initstate.cpp
     vk_manager.cpp
