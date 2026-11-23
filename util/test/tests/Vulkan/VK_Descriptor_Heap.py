@@ -54,6 +54,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_direct_heap_dynamic()
 
+        self.check_heap_texel_null()
+
         self.check_heap_buffers()
 
         self.check_heap_rebind()
@@ -1591,6 +1593,151 @@ class VK_Descriptor_Heap(rdtest.TestCase):
                 rdtest.log.success(f"Thread {x} debugged in {cycles} cycles, 'direct' = {direct} as expected")
 
         self.check_no_validation("direct heap dynamic dispatch debugging")
+
+    def check_heap_texel_null(self):
+        """Uniform/storage texel buffer descriptors with sub-ranges at non-zero offsets, accessed by a direct heap
+        dispatch (including debugging it), and null descriptors of each type if the device supports them"""
+        marker = self.find_action("Heap Texel Indices:")
+        if marker is None:
+            raise rdtest.TestFailureException("Couldn't find the heap texel indices marker")
+
+        layout = {}
+        for item in marker.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        img = layout['imgSize']
+        in_off = layout['in'] * img
+        out_off = layout['out'] * img
+
+        TB = rd.DescriptorType.TypedBuffer
+        RWTB = rd.DescriptorType.ReadWriteTypedBuffer
+
+        rdtest.log.begin_section("Heap Texel Dispatch")
+
+        dispatch = self.find_action("Heap Texel Dispatch").nextAction
+        if not (dispatch.flags & rd.ActionFlags.Dispatch):
+            raise rdtest.TestFailureException(f"Expected a dispatch after the marker, got {dispatch.customName}")
+
+        self.controller.GetDebugMessages()
+        self.set_event(dispatch.eventId, False)
+
+        cs = rd.ShaderStage.Compute
+        self.check_direct_accesses("Texel dispatch", [
+            (cs, TB, 'res', in_off, "heapTexelIn"),
+            (cs, RWTB, 'res', out_off, "heapTexelOut"),
+        ])
+
+        self.check_no_validation("texel dispatch feedback")
+
+        res_heap = self.controller.GetVulkanPipelineState().resourceHeap.buffer
+
+        def fetch(offset, desc_type):
+            r = rd.DescriptorRange()
+            r.offset = offset
+            r.descriptorSize = img
+            r.count = 1
+            r.type = desc_type
+            return r
+
+        # descriptors decode as the right type, buffer, format and sub-range
+        for name, off, typ, buf_name, range_off, range_size in [
+            ("input", in_off, TB, "heapTexelIn", layout['inOffset'], layout['inSize']),
+            ("output", out_off, RWTB, "heapTexelOut", layout['outOffset'], layout['outSize'])]:
+            d = self.controller.GetDescriptors(res_heap, [fetch(off, typ)])[0]
+
+            got = self.get_resource(d.resource).name if d.resource != rd.ResourceId() else None
+            if d.type != typ or got != buf_name:
+                raise rdtest.TestFailureException(f"Texel {name} expected {typ} {buf_name}, got {d.type} {got}")
+
+            if d.byteOffset != range_off or d.byteSize != range_size:
+                raise rdtest.TestFailureException(
+                    f"Texel {name} has range {d.byteOffset}/{d.byteSize}, expected {range_off}/{range_size}")
+
+            f = d.format
+            if f.compType != rd.CompType.Float or f.compCount != 4 or f.compByteWidth != 4:
+                raise rdtest.TestFailureException(f"Texel {name} has unexpected format {f.Name()}")
+
+            loc = self.controller.GetDescriptorLocations(res_heap, [fetch(off, typ)])[0]
+            if loc.logicalBindName != f"ResourceHeap[{layout['in'] if name == 'input' else layout['out']}]":
+                raise rdtest.TestFailureException(f"Texel {name} has location name {loc.logicalBindName}")
+
+        rdtest.log.success("Texel buffer descriptors decoded as expected")
+
+        # the output buffer: texel i of the input sub-range (global texel 16 + i) transformed
+        resources = {r.name: r.resourceId for r in self.controller.GetResources()}
+
+        def texel(i):
+            return [float(i), float(i) * 0.5, 100.0 + float(i), float(i) * 0.25]
+
+        def expected_out(x):
+            v = texel(16 + x)
+            return [v[0] * 2.0, v[1] * 2.0, v[2] * 2.0, v[3] + float(x)]
+
+        out_data = self.controller.GetBufferData(resources["heapTexelOut"], layout['outOffset'], 16 * layout['texels'])
+
+        for x in range(layout['texels']):
+            written = list(struct.unpack_from("4f", out_data, x * 16))
+            if not rdtest.value_compare(written, expected_out(x), eps=0.001):
+                raise rdtest.TestFailureException(f"Texel {x} wrote {written}, expected {expected_out(x)}")
+
+        rdtest.log.success("Texel output buffer has the expected values")
+
+        refl = self.controller.GetPipelineState().GetShaderReflection(cs)
+        if not refl.debugInfo.debuggable:
+            raise rdtest.TestFailureException(f"Texel dispatch is not debuggable: {refl.debugInfo.debugStatus}")
+
+        for x in (0, 1, 3):
+            with self.debug_thread((0, 0, 0), (x, 0, 0)) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                v = list(self.find_last_source_var(debug.trace, variables, 'v').value.f32v[0:4])
+                if not rdtest.value_compare(v, texel(16 + x), eps=0.001):
+                    raise rdtest.TestFailureException(f"Thread {x} debugged 'v' is {v}, expected {texel(16 + x)}")
+
+                rdtest.log.success(f"Thread {x} debugged in {cycles} cycles, read texel {v} as expected")
+
+        self.check_no_validation("texel dispatch debugging")
+
+        rdtest.log.end_section("Heap Texel Dispatch")
+
+        # null descriptors
+        null_marker = self.find_action("Heap Null:")
+        if null_marker is None:
+            rdtest.log.print("No null descriptors in this capture (nullDescriptor not supported), skipping")
+            return
+
+        null_layout = {}
+        for item in null_marker.customName.split(":")[1].split():
+            k, v = item.split("=")
+            null_layout[k] = int(v)
+
+        size = null_layout['size']
+
+        D = rd.DescriptorType
+        nulls = [
+            ('sampledImage', D.Image),
+            ('storageImage', D.ReadWriteImage),
+            ('ubo', D.ConstantBuffer),
+            ('ssbo', D.ReadWriteBuffer),
+            ('texelBuffer', D.TypedBuffer),
+            ('storageTexelBuffer', D.ReadWriteTypedBuffer),
+        ]
+
+        for key, typ in nulls:
+            r = rd.DescriptorRange()
+            r.offset = null_layout[key] * size
+            r.descriptorSize = size
+            r.count = 1
+            r.type = typ
+
+            d = self.controller.GetDescriptors(res_heap, [r])[0]
+
+            if d.resource != rd.ResourceId() or d.type != typ:
+                raise rdtest.TestFailureException(
+                    f"Null {key} descriptor should be empty {typ}, got {d.type} {d.resource}")
+
+        rdtest.log.success("Null descriptors decoded as empty")
 
     def check_direct_heap_access(self):
         layout_action = self.find_action("Direct Heap Indices:")

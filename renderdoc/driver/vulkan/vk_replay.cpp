@@ -2791,9 +2791,39 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
           // should not be larger, only smaller with mutable descriptors
           RDCASSERT(size <= r.descriptorSize);
           if(heap)
+          {
             m_pDriver->LookupHeapDescriptor(descriptor, size, tmp);
+
+            // NULL descriptors of different types can have identical bytes, so the lookup can only
+            // return one of them. There's no resource to disambiguate, so use the requested type
+            if(tmp.type != DescriptorSlotType::Unwritten && tmp.resource == ResourceId())
+            {
+              switch(r.type)
+              {
+                case DescriptorType::Image: tmp.type = DescriptorSlotType::SampledImage; break;
+                case DescriptorType::ReadWriteImage:
+                  tmp.type = DescriptorSlotType::StorageImage;
+                  break;
+                case DescriptorType::TypedBuffer:
+                  tmp.type = DescriptorSlotType::UniformTexelBuffer;
+                  break;
+                case DescriptorType::ReadWriteTypedBuffer:
+                  tmp.type = DescriptorSlotType::StorageTexelBuffer;
+                  break;
+                case DescriptorType::ConstantBuffer:
+                  tmp.type = DescriptorSlotType::UniformBuffer;
+                  break;
+                case DescriptorType::ReadWriteBuffer:
+                  tmp.type = DescriptorSlotType::StorageBuffer;
+                  break;
+                default: break;
+              }
+            }
+          }
           else
+          {
             m_pDriver->LookupDescriptor(descriptor, size, r.type, tmp);
+          }
 
           FillDescriptor(ret[dst], tmp);
         }

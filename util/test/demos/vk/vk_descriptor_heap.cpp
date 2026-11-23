@@ -1054,6 +1054,162 @@ void main(uint3 id : SV_DispatchThreadID)
       0x000000ad, 0x0005000c, 0x0000002e, 0x000000df, 0x00000001, 0x00000018, 0x00010038,
   };
 
+  // Texel buffer compute shader (entry main): reads from a uniform texel buffer and writes to a
+  // storage texel buffer, both from the heap
+  /*
+struct TexelHandles
+{
+  DescriptorHandle<Buffer<float4>> inTexels;
+  DescriptorHandle<RWBuffer<float4>> outTexels;
+};
+
+[[vk::push_constant]] TexelHandles handles;
+
+[shader("compute")]
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+  float4 v = handles.inTexels[id.x];
+  handles.outTexels[id.x] = float4(v.xyz * 2.0f, v.w + float(id.x));
+}
+  */
+
+  const std::vector<uint32_t> texelCompSpirv = {
+      0x07230203, 0x00010400, 0x00280000, 0x00000084, 0x00000000, 0x00020011, 0x0000002e,
+      0x00020011, 0x00001179, 0x00020011, 0x00001408, 0x00020011, 0x0000002f, 0x00020011,
+      0x00000037, 0x00020011, 0x00000038, 0x00020011, 0x00000001, 0x0008000a, 0x5f565053,
+      0x5f52484b, 0x5f6e6f6e, 0x616d6573, 0x6369746e, 0x666e695f, 0x0000006f, 0x0008000a,
+      0x5f565053, 0x5f52484b, 0x79746e75, 0x5f646570, 0x6e696f70, 0x73726574, 0x00000000,
+      0x0007000a, 0x5f565053, 0x5f545845, 0x63736564, 0x74706972, 0x685f726f, 0x00706165,
+      0x000b000b, 0x00000001, 0x536e6f4e, 0x6e616d65, 0x2e636974, 0x64616853, 0x442e7265,
+      0x67756265, 0x6f666e49, 0x3030312e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+      0x0008000f, 0x00000005, 0x00000002, 0x6e69616d, 0x00000000, 0x00000003, 0x00000004,
+      0x00000005, 0x00060010, 0x00000002, 0x00000011, 0x00000004, 0x00000001, 0x00000001,
+      0x005c0007, 0x00000006, 0x75727473, 0x54207463, 0x6c657865, 0x646e6148, 0x0a73656c,
+      0x20200a7b, 0x63736544, 0x74706972, 0x6148726f, 0x656c646e, 0x6675423c, 0x3c726566,
+      0x616f6c66, 0x3e3e3474, 0x546e6920, 0x6c657865, 0x200a3b73, 0x73654420, 0x70697263,
+      0x48726f74, 0x6c646e61, 0x57523c65, 0x66667542, 0x663c7265, 0x74616f6c, 0x203e3e34,
+      0x5474756f, 0x6c657865, 0x7d0a3b73, 0x5b0a0a3b, 0x3a6b765b, 0x7375703a, 0x6f635f68,
+      0x6174736e, 0x5d5d746e, 0x78655420, 0x61486c65, 0x656c646e, 0x61682073, 0x656c646e,
+      0x0a0a3b73, 0x6168735b, 0x28726564, 0x6d6f6322, 0x65747570, 0x0a5d2922, 0x6d756e5b,
+      0x65726874, 0x28736461, 0x31202c34, 0x2931202c, 0x6f760a5d, 0x6d206469, 0x286e6961,
+      0x746e6975, 0x64692033, 0x53203a20, 0x69445f56, 0x74617073, 0x68546863, 0x64616572,
+      0x0a294449, 0x20200a7b, 0x616f6c66, 0x76203474, 0x68203d20, 0x6c646e61, 0x692e7365,
+      0x7865546e, 0x5b736c65, 0x782e6469, 0x200a3b5d, 0x6e616820, 0x73656c64, 0x74756f2e,
+      0x65786554, 0x695b736c, 0x5d782e64, 0x66203d20, 0x74616f6c, 0x2e762834, 0x207a7978,
+      0x2e32202a, 0x202c6630, 0x20772e76, 0x6c66202b, 0x2874616f, 0x782e6469, 0x0a3b2929,
+      0x00000a7d, 0x00200007, 0x00000007, 0x555c3a43, 0x73726573, 0x6e6f6a5c, 0x415c7461,
+      0x61447070, 0x4c5c6174, 0x6c61636f, 0x6d65545c, 0x6c635c70, 0x65647561, 0x6338655c,
+      0x36353834, 0x65316463, 0x33663639, 0x62315c66, 0x35616364, 0x322d3162, 0x2d333131,
+      0x61323234, 0x6135392d, 0x65382d61, 0x37376131, 0x32343137, 0x735c3635, 0x74617263,
+      0x61706863, 0x65745c64, 0x2e6c6578, 0x6e616c73, 0x00000067, 0x00030003, 0x0000000b,
+      0x00000001, 0x00040007, 0x00000008, 0x746e6975, 0x00000000, 0x00040007, 0x00000009,
+      0x6e69616d, 0x00000000, 0x00040007, 0x0000000a, 0x6e616c73, 0x00006367, 0x00300007,
+      0x0000000b, 0x7261742d, 0x20746567, 0x72697073, 0x2d202076, 0x43222049, 0x75565c3a,
+      0x6e616b6c, 0x5c4b4453, 0x2e342e31, 0x2e333633, 0x69425c31, 0x2d20226e, 0x7274616d,
+      0x6c2d7869, 0x756f7961, 0x6f632d74, 0x6e6d756c, 0x6a616d2d, 0x2d20726f, 0x2d20324f,
+      0x2d203267, 0x666f7270, 0x20656c69, 0x72697073, 0x5f315f76, 0x632d2034, 0x62617061,
+      0x74696c69, 0x70732079, 0x73654476, 0x70697263, 0x48726f74, 0x45706165, 0x2d205458,
+      0x74696d65, 0x6970732d, 0x642d7672, 0x63657269, 0x20796c74, 0x6174732d, 0x63206567,
+      0x75706d6f, 0x2d206574, 0x72746e65, 0x616d2079, 0x00006e69, 0x00030007, 0x0000000c,
+      0x00006469, 0x00040007, 0x0000000d, 0x616f6c66, 0x00000074, 0x00030007, 0x0000000e,
+      0x00000076, 0x00040007, 0x0000000f, 0x616e6e75, 0x0064656d, 0x00050007, 0x00000010,
+      0x6e6e7540, 0x64656d61, 0x00000000, 0x00050007, 0x00000011, 0x65546e69, 0x736c6578,
+      0x00000000, 0x00050007, 0x00000012, 0x5474756f, 0x6c657865, 0x00000073, 0x00070007,
+      0x00000013, 0x65786554, 0x6e61486c, 0x73656c64, 0x6474735f, 0x00303334, 0x00040007,
+      0x00000014, 0x646e6168, 0x0073656c, 0x00030005, 0x00000015, 0x00006469, 0x00030005,
+      0x00000016, 0x00000076, 0x00070005, 0x00000017, 0x65786554, 0x6e61486c, 0x73656c64,
+      0x6474735f, 0x00303334, 0x00060006, 0x00000017, 0x00000000, 0x65546e69, 0x736c6578,
+      0x00000000, 0x00060006, 0x00000017, 0x00000001, 0x5474756f, 0x6c657865, 0x00000073,
+      0x00040005, 0x00000004, 0x646e6168, 0x0073656c, 0x00070005, 0x00000003, 0x6e616c73,
+      0x65725f67, 0x72756f73, 0x65486563, 0x00007061, 0x00050005, 0x00000018, 0x61735f5f,
+      0x656c706d, 0x00000064, 0x00040005, 0x00000002, 0x6e69616d, 0x00000000, 0x00040047,
+      0x00000005, 0x0000000b, 0x0000001c, 0x00030047, 0x00000017, 0x00000002, 0x00050048,
+      0x00000017, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000017, 0x00000001,
+      0x00000023, 0x00000008, 0x0004014c, 0x00000019, 0x00001404, 0x0000001a, 0x00040047,
+      0x00000003, 0x0000000b, 0x00001403, 0x0004014c, 0x0000001b, 0x00001404, 0x0000001c,
+      0x00020013, 0x0000001d, 0x00040015, 0x0000001e, 0x00000020, 0x00000000, 0x0004002b,
+      0x0000001e, 0x0000001f, 0x0000000b, 0x0004002b, 0x0000001e, 0x00000020, 0x00000005,
+      0x0004002b, 0x0000001e, 0x00000021, 0x00000064, 0x00030021, 0x00000022, 0x0000001d,
+      0x00040017, 0x00000023, 0x0000001e, 0x00000003, 0x00030016, 0x00000024, 0x00000020,
+      0x00040017, 0x00000025, 0x00000024, 0x00000004, 0x0004002b, 0x0000001e, 0x00000026,
+      0x00000020, 0x0004002b, 0x0000001e, 0x00000027, 0x00000006, 0x0004002b, 0x0000001e,
+      0x00000028, 0x00020000, 0x0004002b, 0x0000001e, 0x00000029, 0x00000003, 0x0004002b,
+      0x0000001e, 0x0000002a, 0x00000000, 0x0004002b, 0x0000001e, 0x0000002b, 0x00000001,
+      0x00040020, 0x0000002c, 0x00000001, 0x00000023, 0x0004002b, 0x0000001e, 0x0000002d,
+      0x0000000d, 0x0004002b, 0x0000001e, 0x0000002e, 0x00000004, 0x0004002b, 0x0000001e,
+      0x0000002f, 0x0000000a, 0x00040017, 0x00000030, 0x0000001e, 0x00000002, 0x0004001e,
+      0x00000017, 0x00000030, 0x00000030, 0x00040020, 0x00000031, 0x00000009, 0x00000017,
+      0x0004002b, 0x0000001e, 0x00000032, 0x00000024, 0x0004002b, 0x0000001e, 0x00000033,
+      0x00000040, 0x0004002b, 0x0000001e, 0x00000034, 0x00000026, 0x0004002b, 0x0000001e,
+      0x00000035, 0x00000080, 0x0004002b, 0x0000001e, 0x00000036, 0x00000007, 0x00040015,
+      0x00000037, 0x00000020, 0x00000001, 0x0004002b, 0x00000037, 0x00000038, 0x00000000,
+      0x00040020, 0x00000039, 0x00000009, 0x00000030, 0x00090019, 0x0000003a, 0x00000024,
+      0x00000005, 0x00000002, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00041409,
+      0x0000001e, 0x0000001a, 0x0000003a, 0x0003001d, 0x00000019, 0x0000003a, 0x00031141,
+      0x0000003b, 0x00000000, 0x0004002b, 0x0000001e, 0x0000003c, 0x0000000e, 0x0004002b,
+      0x00000037, 0x0000003d, 0x00000001, 0x00090019, 0x0000003e, 0x00000024, 0x00000005,
+      0x00000002, 0x00000000, 0x00000000, 0x00000002, 0x00000000, 0x00041409, 0x0000001e,
+      0x0000001c, 0x0000003e, 0x0003001d, 0x0000001b, 0x0000003e, 0x00040017, 0x0000003f,
+      0x00000024, 0x00000003, 0x0004002b, 0x00000024, 0x00000040, 0x40000000, 0x0004003b,
+      0x0000002c, 0x00000005, 0x00000001, 0x0004003b, 0x00000031, 0x00000004, 0x00000009,
+      0x00041142, 0x0000003b, 0x00000003, 0x00000000, 0x00030001, 0x00000023, 0x00000041,
+      0x0005000c, 0x0000001d, 0x00000042, 0x00000001, 0x00000000, 0x0005000c, 0x0000001d,
+      0x00000043, 0x00000001, 0x0000001f, 0x0007000c, 0x0000001d, 0x00000044, 0x00000001,
+      0x00000023, 0x00000007, 0x00000006, 0x0009000c, 0x0000001d, 0x00000045, 0x00000001,
+      0x00000001, 0x00000021, 0x00000020, 0x00000044, 0x0000001f, 0x0009000c, 0x0000001d,
+      0x00000046, 0x00000001, 0x00000002, 0x00000008, 0x00000026, 0x00000027, 0x00000028,
+      0x0007000c, 0x0000001d, 0x00000047, 0x00000001, 0x00000006, 0x00000046, 0x00000029,
+      0x0008000c, 0x0000001d, 0x00000048, 0x00000001, 0x00000008, 0x0000002a, 0x0000001d,
+      0x00000047, 0x000e000c, 0x0000001d, 0x00000049, 0x00000001, 0x00000014, 0x00000009,
+      0x00000048, 0x00000044, 0x0000001f, 0x00000027, 0x00000045, 0x00000009, 0x0000002a,
+      0x0000001f, 0x0009000c, 0x0000001d, 0x0000004a, 0x00000001, 0x0000006b, 0x00000049,
+      0x00000045, 0x0000000a, 0x0000000b, 0x000d000c, 0x0000001d, 0x00000015, 0x00000001,
+      0x0000001a, 0x0000000c, 0x00000047, 0x00000044, 0x0000001f, 0x00000027, 0x00000049,
+      0x0000002a, 0x0000002b, 0x0009000c, 0x0000001d, 0x0000004b, 0x00000001, 0x00000002,
+      0x0000000d, 0x00000026, 0x00000029, 0x00000028, 0x0007000c, 0x0000001d, 0x0000004c,
+      0x00000001, 0x00000006, 0x0000004b, 0x0000002e, 0x000c000c, 0x0000001d, 0x00000016,
+      0x00000001, 0x0000001a, 0x0000000e, 0x0000004c, 0x00000044, 0x0000002d, 0x0000002f,
+      0x00000049, 0x0000002a, 0x000e000c, 0x0000001d, 0x0000004d, 0x00000001, 0x0000000a,
+      0x0000000f, 0x0000002a, 0x00000044, 0x0000002a, 0x0000002a, 0x00000045, 0x00000010,
+      0x00000042, 0x00000028, 0x000d000c, 0x0000001d, 0x0000004e, 0x00000001, 0x0000000b,
+      0x00000011, 0x0000004d, 0x00000044, 0x00000029, 0x00000032, 0x0000002a, 0x00000033,
+      0x0000002a, 0x000e000c, 0x0000001d, 0x0000004f, 0x00000001, 0x0000000a, 0x0000000f,
+      0x0000002a, 0x00000044, 0x0000002a, 0x0000002a, 0x00000045, 0x00000010, 0x00000042,
+      0x00000028, 0x000d000c, 0x0000001d, 0x00000050, 0x00000001, 0x0000000b, 0x00000012,
+      0x0000004f, 0x00000044, 0x0000002e, 0x00000034, 0x00000033, 0x00000033, 0x0000002a,
+      0x0010000c, 0x0000001d, 0x00000051, 0x00000001, 0x0000000a, 0x00000013, 0x0000002b,
+      0x00000044, 0x0000002a, 0x0000002a, 0x00000045, 0x00000013, 0x00000035, 0x00000028,
+      0x0000004e, 0x00000050, 0x000e000c, 0x0000001d, 0x00000052, 0x00000001, 0x00000012,
+      0x00000014, 0x00000051, 0x00000044, 0x00000036, 0x00000032, 0x00000045, 0x00000014,
+      0x00000004, 0x0000002a, 0x00050036, 0x0000001d, 0x00000002, 0x00000000, 0x00000022,
+      0x000200f8, 0x00000053, 0x0007000c, 0x0000001d, 0x00000054, 0x00000001, 0x00000065,
+      0x00000049, 0x00000002, 0x0006000c, 0x0000001d, 0x00000082, 0x00000001, 0x00000017,
+      0x00000049, 0x000a000c, 0x0000001d, 0x00000055, 0x00000001, 0x00000067, 0x00000044,
+      0x0000001f, 0x0000001f, 0x00000027, 0x00000027, 0x0008000c, 0x0000001d, 0x00000056,
+      0x00000001, 0x0000001d, 0x00000015, 0x00000041, 0x00000043, 0x000a000c, 0x0000001d,
+      0x00000057, 0x00000001, 0x00000067, 0x00000044, 0x0000002d, 0x0000002d, 0x00000029,
+      0x0000002e, 0x00050041, 0x00000039, 0x00000058, 0x00000004, 0x00000038, 0x0004003d,
+      0x00000030, 0x0000005a, 0x00000058, 0x00050051, 0x0000001e, 0x0000005c, 0x0000005a,
+      0x00000000, 0x00061143, 0x0000003b, 0x0000005e, 0x00000019, 0x00000003, 0x0000005c,
+      0x0004003d, 0x0000003a, 0x00000060, 0x0000005e, 0x0004003d, 0x00000023, 0x00000062,
+      0x00000005, 0x00050051, 0x0000001e, 0x00000064, 0x00000062, 0x00000000, 0x0004007c,
+      0x00000037, 0x00000066, 0x00000064, 0x0005005f, 0x00000025, 0x00000018, 0x00000060,
+      0x00000066, 0x0008000c, 0x0000001d, 0x00000069, 0x00000001, 0x0000001d, 0x00000016,
+      0x00000018, 0x00000043, 0x000a000c, 0x0000001d, 0x0000006a, 0x00000001, 0x00000067,
+      0x00000044, 0x0000003c, 0x0000003c, 0x00000029, 0x0000002e, 0x00050041, 0x00000039,
+      0x0000006b, 0x00000004, 0x0000003d, 0x0004003d, 0x00000030, 0x0000006d, 0x0000006b,
+      0x00050051, 0x0000001e, 0x0000006f, 0x0000006d, 0x00000000, 0x00061143, 0x0000003b,
+      0x00000071, 0x0000001b, 0x00000003, 0x0000006f, 0x0004003d, 0x0000003e, 0x00000073,
+      0x00000071, 0x0008004f, 0x0000003f, 0x00000075, 0x00000018, 0x00000018, 0x00000000,
+      0x00000001, 0x00000002, 0x0005008e, 0x0000003f, 0x00000077, 0x00000075, 0x00000040,
+      0x00050051, 0x00000024, 0x00000079, 0x00000018, 0x00000003, 0x00040070, 0x00000024,
+      0x0000007b, 0x00000064, 0x00050081, 0x00000024, 0x0000007d, 0x00000079, 0x0000007b,
+      0x00050050, 0x00000025, 0x0000007f, 0x00000077, 0x0000007d, 0x00040063, 0x00000073,
+      0x00000064, 0x0000007f, 0x000100fd, 0x0005000c, 0x0000001d, 0x00000083, 0x00000001,
+      0x00000018, 0x00010038,
+  };
+
   const std::vector<uint32_t> directVertSpirv = {
       0x07230203, 0x00010400, 0x00280000, 0x000000b3, 0x00000000, 0x00020011, 0x00001179,
       0x00020011, 0x00001408, 0x00020011, 0x00000001, 0x0008000a, 0x5f565053, 0x5f52484b,
@@ -2292,6 +2448,12 @@ float4 psmain(V2F IN) : SV_Target0
     uint32_t sampIdx;
   };
 
+  struct TexelHandles
+  {
+    DescriptorHandle inTexels;
+    DescriptorHandle outTexels;
+  };
+
   struct BufferHandles
   {
     DescriptorHandle inParticles;
@@ -2347,6 +2509,9 @@ float4 psmain(V2F IN) : SV_Target0
     uint32_t ssboElem;
   };
 
+  // whether null descriptors can be written (robustness2 nullDescriptor), optional
+  bool nullDescriptors = false;
+
   std::vector<AllocatedImage> images;
   std::vector<AllocatedBuffer> buffers;
 
@@ -2369,6 +2534,9 @@ float4 psmain(V2F IN) : SV_Target0
     // the array draw indexes arrays of sampled images and storage buffers dynamically
     features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
     features.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
+
+    // null descriptors are only written if the device supports them, they're optional
+    optDevExts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
     // the array draw is in an extra row below the 4x4 grid of cells (see cellH in the frame)
     screenHeight = screenHeight * 5 / 4;
@@ -2435,6 +2603,26 @@ float4 psmain(V2F IN) : SV_Target0
 
     untypedFeats.pNext = (void *)devInfoNext;
     devInfoNext = &untypedFeats;
+
+    // enable null descriptors if the optional extension was enabled and the feature is supported
+    if(std::find(devExts.begin(), devExts.end(), VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) != devExts.end())
+    {
+      static VkPhysicalDeviceRobustness2FeaturesEXT robust2Feats = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+      };
+
+      VkPhysicalDeviceRobustness2FeaturesEXT robust2Avail = robust2Feats;
+      getPhysFeatures2(&robust2Avail);
+
+      if(robust2Avail.nullDescriptor)
+      {
+        robust2Feats.nullDescriptor = VK_TRUE;
+        nullDescriptors = true;
+      }
+
+      robust2Feats.pNext = (void *)devInfoNext;
+      devInfoNext = &robust2Feats;
+    }
   }
 
   static uint64_t Align(uint64_t x, uint64_t a) { return (x + a - 1) & ~(a - 1); }
@@ -2467,6 +2655,36 @@ float4 psmain(V2F IN) : SV_Target0
     info.data.pAddressRange = &range;
 
     VkHostAddressRangeEXT host = {dst, (size_t)heapProps.bufferDescriptorSize};
+
+    CHECK_VKR(vkWriteResourceDescriptorsEXT(device, 1, &info, &host));
+  }
+
+  void WriteTexelBufferDescriptor(void *dst, VkDescriptorType type, VkFormat format,
+                                  VkDeviceAddress address, VkDeviceSize size)
+  {
+    VkTexelBufferDescriptorInfoEXT texel = {VK_STRUCTURE_TYPE_TEXEL_BUFFER_DESCRIPTOR_INFO_EXT};
+    texel.format = format;
+    texel.addressRange = {address, size};
+
+    VkResourceDescriptorInfoEXT info = {VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT};
+    info.type = type;
+    info.data.pTexelBuffer = &texel;
+
+    // texel buffer descriptors are never larger than image descriptors
+    VkHostAddressRangeEXT host = {dst, (size_t)heapProps.imageDescriptorSize};
+
+    CHECK_VKR(vkWriteResourceDescriptorsEXT(device, 1, &info, &host));
+  }
+
+  // a null descriptor is written by passing a NULL pointer for the type's descriptor data
+  void WriteNullDescriptor(void *dst, VkDescriptorType type)
+  {
+    VkResourceDescriptorInfoEXT info = {VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT};
+    info.type = type;
+    info.data.pImage = NULL;
+
+    VkHostAddressRangeEXT host = {
+        dst, (size_t)std::max(heapProps.imageDescriptorSize, heapProps.bufferDescriptorSize)};
 
     CHECK_VKR(vkWriteResourceDescriptorsEXT(device, 1, &info, &host));
   }
@@ -2528,14 +2746,14 @@ float4 psmain(V2F IN) : SV_Target0
 
   // a named buffer with arbitrary contents, which can also be filled with transfers
   VkDeviceAddress MakeDataBuffer(const char *name, const void *data, size_t size,
-                                 VkBuffer *outBuffer = NULL)
+                                 VkBuffer *outBuffer = NULL, VkBufferUsageFlags extraUsage = 0)
   {
     AllocatedBuffer buf(
         this,
         vkh::BufferCreateInfo(size, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR |
                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT),
+                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT | extraUsage),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
     setName(buf.buffer, name);
     buf.upload(data, size);
@@ -2742,6 +2960,38 @@ float4 psmain(V2F IN) : SV_Target0
     if((dynOutIdx + 1) * bufSize > userHeapSize)
     {
       TEST_ERROR("Descriptor sizes are too big to fit the dynamic indexing descriptors");
+      return 4;
+    }
+
+    // texel buffers: an input and an output descriptor after the dynamic indexing descriptors.
+    // Their size in the shader is the image descriptor class size
+    const uint32_t texelInIdx = ((dynOutIdx + 1) * bufSize + imgSize - 1) / imgSize;
+    const uint32_t texelOutIdx = texelInIdx + 1;
+    // sub-ranges at non-zero offsets, which must be aligned to the texel buffer alignment
+    const VkDeviceSize texelInOffset = 0x100, texelInSize = 0x80;
+    const VkDeviceSize texelOutOffset = 0x40, texelOutSize = 0x40;
+    // number of texels the shader reads/writes
+    const uint32_t numTexels = 4;
+    // null descriptors, one of each type, after the texel buffers
+    const VkDescriptorType nullTypes[] = {
+        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+    };
+    const uint32_t nullSize = std::max(imgSize, bufSize);
+    const uint32_t nullIdx = (texelOutIdx + 1) * imgSize / nullSize + 1;
+
+    if((nullIdx + ARRAY_COUNT(nullTypes)) * nullSize > userHeapSize ||
+       (texelOutIdx + 1) * imgSize > userHeapSize)
+    {
+      TEST_ERROR("Descriptor sizes are too big to fit the texel buffer descriptors");
+      return 4;
+    }
+
+    if(heapProps.imageDescriptorSize < heapProps.bufferDescriptorSize ||
+       physProperties.limits.minTexelBufferOffsetAlignment > texelOutOffset)
+    {
+      TEST_ERROR("Unexpected descriptor sizes or texel buffer alignment");
       return 4;
     }
 
@@ -3034,6 +3284,36 @@ float4 psmain(V2F IN) : SV_Target0
       WriteBufferDescriptor(resPtr + dynOutIdx * bufSize, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dynOut,
                             sizeof(zeroes));
       WriteSamplerDescriptor(sampPtr + dynSampIdx * sampSize, sampInfo);
+    }
+
+    // texel buffers: 64 vec4 texels in one buffer with the input as a sub-range in the middle, and
+    // a zeroed output buffer with the output as a sub-range
+    {
+      Vec4f texels[64];
+      for(uint32_t i = 0; i < 64; i++)
+        texels[i] = Vec4f(float(i), float(i) * 0.5f, 100.0f + float(i), float(i) * 0.25f);
+
+      VkDeviceAddress texelIn = MakeDataBuffer(
+          "heapTexelIn", texels, sizeof(texels), NULL,
+          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+      WriteTexelBufferDescriptor(
+          resPtr + texelInIdx * imgSize, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+          VK_FORMAT_R32G32B32A32_SFLOAT, texelIn + texelInOffset, texelInSize);
+
+      byte zeroes[0x100] = {};
+      VkDeviceAddress texelOut = MakeDataBuffer(
+          "heapTexelOut", zeroes, sizeof(zeroes), NULL,
+          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+      WriteTexelBufferDescriptor(
+          resPtr + texelOutIdx * imgSize, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
+          VK_FORMAT_R32G32B32A32_SFLOAT, texelOut + texelOutOffset, texelOutSize);
+    }
+
+    // null descriptors of each type, if supported
+    if(nullDescriptors)
+    {
+      for(uint32_t i = 0; i < ARRAY_COUNT(nullTypes); i++)
+        WriteNullDescriptor(resPtr + (nullIdx + i) * nullSize, nullTypes[i]);
     }
 
     // a second pair of heaps, with a different reserved range, which the frame rebinds mid command
@@ -3354,6 +3634,20 @@ float4 psmain(V2F IN) : SV_Target0
       dynComputePipe = createComputePipeline(compCreateInfo);
     }
 
+    VkPipeline texelComputePipe;
+    {
+      VkShaderModule cs;
+      CHECK_VKR(vkCreateShaderModule(device, vkh::ShaderModuleCreateInfo(texelCompSpirv), NULL, &cs));
+      shaders.push_back(cs);
+
+      vkh::ComputePipelineCreateInfo compCreateInfo(
+          VK_NULL_HANDLE,
+          vkh::PipelineShaderStageCreateInfo(cs, VK_SHADER_STAGE_COMPUTE_BIT, "main"));
+      compCreateInfo.pNext = &flags2;
+
+      texelComputePipe = createComputePipeline(compCreateInfo);
+    }
+
     VkPipeline bufferComputePipe;
     {
       VkShaderModule cs;
@@ -3560,6 +3854,42 @@ float4 psmain(V2F IN) : SV_Target0
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dynComputePipe);
         setMarker(cmd, "Direct Heap Dynamic Dispatch");
         vkCmdDispatch(cmd, 1, 1, 1);
+      }
+
+      setMarker(cmd, "Heap Texel Indices: imgSize=" + std::to_string(imgSize) +
+                         " bufSize=" + std::to_string(bufSize) + " in=" + std::to_string(texelInIdx) +
+                         " out=" + std::to_string(texelOutIdx) + " inOffset=" +
+                         std::to_string(texelInOffset) + " inSize=" + std::to_string(texelInSize) +
+                         " outOffset=" + std::to_string(texelOutOffset) + " outSize=" +
+                         std::to_string(texelOutSize) + " texels=" + std::to_string(numTexels));
+
+      // dispatch reading from a uniform texel buffer and writing to a storage texel buffer
+      {
+        TexelHandles handles = {};
+        handles.inTexels.index = texelInIdx;
+        handles.outTexels.index = texelOutIdx;
+
+        VkPushDataInfoEXT pushInfo = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+        pushInfo.offset = 0;
+        pushInfo.data.address = &handles;
+        pushInfo.data.size = sizeof(handles);
+        vkCmdPushDataEXT(cmd, &pushInfo);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, texelComputePipe);
+        setMarker(cmd, "Heap Texel Dispatch");
+        vkCmdDispatch(cmd, 1, 1, 1);
+      }
+
+      // null descriptors are only written if the device supports them. Nothing accesses them, the
+      // test only inspects the descriptors
+      if(nullDescriptors)
+      {
+        setMarker(cmd, "Heap Null: size=" + std::to_string(nullSize) +
+                           " sampledImage=" + std::to_string(nullIdx + 0) + " storageImage=" +
+                           std::to_string(nullIdx + 1) + " ubo=" + std::to_string(nullIdx + 2) +
+                           " ssbo=" + std::to_string(nullIdx + 3) +
+                           " texelBuffer=" + std::to_string(nullIdx + 4) +
+                           " storageTexelBuffer=" + std::to_string(nullIdx + 5));
       }
 
       vkCmdBeginRenderPass(
