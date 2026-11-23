@@ -58,6 +58,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_mapped_sources()
 
+        self.check_heap_secondary()
+
         self.check_direct_heap_access()
 
         self.check_direct_heap_dynamic()
@@ -1158,6 +1160,118 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             check_draw(name, *rest, debug_pixel=False)
 
         rdtest.log.end_section("Heap rebind partial replay")
+
+    def check_heap_secondary(self):
+        """Secondary command buffers: one inherits the primary's heaps through
+        VkCommandBufferInheritanceDescriptorHeapInfoEXT, one binds the second heap pair itself"""
+        layout_action = self.find_action("Heap2 Layout:")
+
+        layout = {}
+        for item in layout_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        img = layout['imgSize']
+        buf = layout['bufSize']
+        samp = layout['sampDescSize']
+
+        vs = rd.ShaderStage.Vertex
+        ps = rd.ShaderStage.Pixel
+        Image = rd.DescriptorType.Image
+        RWBuffer = rd.DescriptorType.ReadWriteBuffer
+        Sampler = rd.DescriptorType.Sampler
+
+        res1 = (layout['resReservedOffset1'], layout['resReservedSize1'], layout['resSize1'])
+        samp1 = (layout['sampReservedOffset1'], layout['sampReservedSize1'], layout['sampSize1'])
+        res2 = (layout['resReservedOffset'], layout['resReservedSize'], layout['resSize'])
+        samp2 = (layout['sampReservedOffset'], layout['sampReservedSize'], layout['sampSize'])
+
+        grey = (0.2, 0.2, 0.2, 1.0)
+        orange = (1.0, 0.5, 0.0, 1.0)
+        azure = (0.0, 0.5, 1.0, 1.0)
+
+        point_clamp = (rd.FilterMode.Point, rd.AddressMode.ClampEdge)
+        linear_repeat = (rd.FilterMode.Linear, rd.AddressMode.Wrap)
+
+        orig = (("resHeap", res1), ("sampHeap", samp1), "directTex", "directBuf", point_clamp,
+                [(0.5, 0.5, orange), (0.15, 0.15, grey)])
+        other = (("resHeap2", res2), ("sampHeap2", samp2), "heap2Tex", "heap2Buf", linear_repeat,
+                 [(0.5, 0.5, azure), (0.15, 0.15, azure), (0.05, 0.05, grey)])
+
+        draws = [
+            ("Heap Secondary Inherited Draw", *orig),
+            ("Heap Secondary Bound Draw", *other),
+            ("Heap After Secondary", *orig),
+        ]
+
+        def check_draw(name, res_heap, samp_heap, tex, bufname, sampler, pixels, debug_pixel=True):
+            action = self.find_action(name)
+            if action is None:
+                raise rdtest.TestFailureException(f"Couldn't find marker {name}")
+
+            draw = action.nextAction
+            if not (draw.flags & rd.ActionFlags.Drawcall):
+                raise rdtest.TestFailureException(f"Expected a draw after {name}, got {draw.customName}")
+
+            self.controller.GetDebugMessages()
+            self.set_event(draw.eventId, False)
+
+            pipe = self.controller.GetVulkanPipelineState()
+
+            for kind, heap, (expected_name, (reserved_off, reserved_size, size)) in (
+                    ("resource", pipe.resourceHeap, res_heap), ("sampler", pipe.samplerHeap, samp_heap)):
+                got_name = self.get_resource(heap.buffer).name if heap.buffer != rd.ResourceId() else None
+                if got_name != expected_name:
+                    raise rdtest.TestFailureException(f"{name}: {kind} heap is {got_name}, expected {expected_name}")
+
+                if (heap.offset, heap.size, heap.reservedOffset, heap.reservedSize) != (0, size, reserved_off,
+                                                                                       reserved_size):
+                    raise rdtest.TestFailureException(
+                        f"{name}: {kind} heap range {heap.offset}/{heap.size}/{heap.reservedOffset}/"
+                        f"{heap.reservedSize}, expected 0/{size}/{reserved_off}/{reserved_size}")
+
+            self.check_direct_accesses(name, [
+                (vs, RWBuffer, 'res', layout['buf'] * buf, bufname),
+                (ps, RWBuffer, 'res', layout['buf'] * buf, bufname),
+                (ps, Image, 'res', layout['tex'] * img, tex),
+                (ps, Sampler, 'samp', layout['samp'] * samp, None),
+            ], samp_expect=sampler)
+
+            v = self.controller.GetPipelineState().GetViewport(0)
+            out = self.controller.GetPipelineState().GetOutputTargets()[0].resource
+
+            for fx, fy, col in pixels:
+                self.check_pixel_value(out, int(v.x + v.width * fx), int(v.y + v.height * fy), col, eps=0.02)
+
+            if debug_pixel:
+                self.check_debug_pixel(int(v.x + v.width * 0.5), int(v.y + v.height * 0.5))
+
+            self.check_no_validation(f"{name} replay")
+
+            rdtest.log.success(f"{name} is as expected")
+
+        rdtest.log.begin_section("Heap secondary command buffers")
+
+        for d in draws:
+            rdtest.log.begin_section(d[0])
+            check_draw(*d)
+            rdtest.log.end_section(d[0])
+
+        # partial replay: from the end of the frame back into the secondaries, and forwards from the start
+        last = self.get_last_action()
+        for name, *rest in reversed(draws):
+            self.set_event(last.eventId, True)
+            check_draw(name, *rest, debug_pixel=False)
+
+        for name, *rest in draws:
+            self.set_event(self.find_action("Heap Test 0").nextAction.eventId, True)
+            check_draw(name, *rest, debug_pixel=False)
+
+        # and from one secondary to the other
+        self.set_event(self.find_action("Heap Secondary Bound Draw").nextAction.eventId, True)
+        check_draw(*draws[0], debug_pixel=False)
+
+        rdtest.log.end_section("Heap secondary command buffers")
 
     def check_heap_disassembly(self):
         """Every shader used by a draw or dispatch must disassemble. The Slang-compiled direct heap shaders put

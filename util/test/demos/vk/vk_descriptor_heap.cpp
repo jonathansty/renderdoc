@@ -4516,6 +4516,99 @@ float4 psmain(V2F IN) : SV_Target0
 
       vkCmdEndRenderPass(cmd);
 
+      // secondary command buffers, in the last cells of the grid. The main render pass loads its
+      // attachment, so a second instance of it with secondary contents keeps the output so far
+      {
+        VkCommandBufferInheritanceInfo inherit = vkh::CommandBufferInheritanceInfo(mainWindow->rp, 0);
+
+        // the first one doesn't bind any heaps, it inherits the ones bound in the primary command
+        // buffer at the time of execution
+        VkCommandBufferInheritanceDescriptorHeapInfoEXT heapInherit = {
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT};
+        heapInherit.pSamplerHeapBindInfo = &sampBind;
+        heapInherit.pResourceHeapBindInfo = &resBind;
+        inherit.pNext = &heapInherit;
+
+        auto recordSecondary = [&](bool inherits, uint32_t secondaryCell, const char *marker) {
+          VkCommandBuffer sec = GetCommandBuffer(VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+
+          VkCommandBufferInheritanceInfo info = inherit;
+          if(!inherits)
+            info.pNext = NULL;
+
+          vkBeginCommandBuffer(sec, vkh::CommandBufferBeginInfo(
+                                        VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, &info));
+
+          if(!inherits)
+          {
+            vkCmdBindResourceHeapEXT(sec, &resBind2);
+            vkCmdBindSamplerHeapEXT(sec, &sampBind2);
+          }
+
+          vkCmdSetScissor(sec, 0, 1, &mainWindow->scissor);
+          VkViewport v = {cellW * float(secondaryCell % 4),
+                          cellH * float(secondaryCell / 4),
+                          cellW,
+                          cellH,
+                          0.0f,
+                          1.0f};
+          vkCmdSetViewport(sec, 0, 1, &v);
+
+          DirectDrawHandles handles = {};
+          handles.buf.index = directBufIdx;
+          handles.tex.index = directTexIdx;
+          handles.samp.index = directSampIdx;
+
+          VkPushDataInfoEXT pushInfo = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+          pushInfo.offset = 0;
+          pushInfo.data.address = &handles;
+          pushInfo.data.size = sizeof(handles);
+          vkCmdPushDataEXT(sec, &pushInfo);
+
+          setMarker(sec, marker);
+          vkCmdBindPipeline(sec, VK_PIPELINE_BIND_POINT_GRAPHICS, directGraphicsPipe);
+          vkCmdDraw(sec, 4, 1, 0, 0);
+
+          vkEndCommandBuffer(sec);
+
+          return sec;
+        };
+
+        VkCommandBuffer secs[2] = {
+            recordSecondary(true, cell, "Heap Secondary Inherited Draw"),
+            recordSecondary(false, cell + 1, "Heap Secondary Bound Draw"),
+        };
+
+        setMarker(cmd, "Heap Secondary Layout: inheritedCell=" + std::to_string(cell) +
+                           " boundCell=" + std::to_string(cell + 1) +
+                           " afterCell=" + std::to_string(cell + 2));
+
+        // the heaps bound in the primary are the original pair, which the first secondary inherits
+        vkCmdBeginRenderPass(
+            cmd, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+            VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+
+        vkCmdExecuteCommands(cmd, 2, secs);
+
+        vkCmdEndRenderPass(cmd);
+        cell += 2;
+
+        // the state of the primary command buffer is undefined after executing secondary command
+        // buffers, and the second one bound the other heap pair, so bind the original pair again
+        vkCmdBeginRenderPass(
+            cmd, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+            VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
+        setCell();
+        vkCmdBindResourceHeapEXT(cmd, &resBind);
+        vkCmdBindSamplerHeapEXT(cmd, &sampBind);
+        pushDirectHandles(directTexIdx);
+        directDraw("Heap After Secondary");
+
+        vkCmdEndRenderPass(cmd);
+      }
+
       FinishUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
 
       vkEndCommandBuffer(cmd);
