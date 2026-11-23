@@ -13,6 +13,10 @@ class VK_Descriptor_Heap(rdtest.TestCase):
         return opts
 
     def check_capture(self):
+        # messages generated while loading the capture (e.g. by resource usage tracking) are only returned by the
+        # first call, before any check consumes them
+        self.check_no_validation("capture load")
+
         # each test draws into its own viewport. Each entry is a list of (x fraction, y fraction, colour) to check
         # within that viewport. The tests that scale the UVs by 2 hit the sampler's border colour in the upper right
         # of the viewport and the texture in the lower left

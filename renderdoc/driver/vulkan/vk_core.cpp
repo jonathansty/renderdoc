@@ -6470,6 +6470,12 @@ void WrappedVulkan::AddUsage(VulkanEventNode &eventNode)
   //////////////////////////////
   // Shaders
 
+  // descriptor heap pipelines and shader objects have no descriptor sets, their set/binding
+  // resources are mapped into the heaps.
+  // TODO(heap): resource usage for resources accessed through descriptor heaps
+  if(state.UsesDescriptorHeaps(this, compute))
+    return;
+
   if(pipeState.UsingDescBufs())
   {
     eventNode.deferredResourceUsage.push_back({});
