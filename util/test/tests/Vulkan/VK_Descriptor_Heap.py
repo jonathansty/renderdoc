@@ -46,6 +46,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             [(0.25, 0.25, red), (0.75, 0.75, custom)],
         ]
 
+        self.check_heap_disassembly()
+
         self.check_heap_descriptors()
 
         self.check_heap_view_variety()
@@ -1156,6 +1158,41 @@ class VK_Descriptor_Heap(rdtest.TestCase):
             check_draw(name, *rest, debug_pixel=False)
 
         rdtest.log.end_section("Heap rebind partial replay")
+
+    def check_heap_disassembly(self):
+        """Every shader used by a draw or dispatch must disassemble. The Slang-compiled direct heap shaders put
+        non-semantic debug instructions between block terminators and labels, which the disassembler must skip"""
+        count = 0
+        for action in self.controller.GetRootActions():
+            for a in [action] + self.flatten_actions(action.children):
+                if not (a.flags & (rd.ActionFlags.Drawcall | rd.ActionFlags.Dispatch)):
+                    continue
+
+                self.controller.SetFrameEvent(a.eventId, False)
+                pipe = self.controller.GetPipelineState()
+
+                compute = bool(a.flags & rd.ActionFlags.Dispatch)
+                stages = [rd.ShaderStage.Compute] if compute else [rd.ShaderStage.Vertex, rd.ShaderStage.Pixel]
+                pipe_obj = pipe.GetComputePipelineObject() if compute else pipe.GetGraphicsPipelineObject()
+
+                for stage in stages:
+                    refl = pipe.GetShaderReflection(stage)
+                    if refl is None:
+                        continue
+                    disasm = self.controller.DisassembleShader(pipe_obj, refl, "")
+                    if disasm == "" or "error" in disasm.lower()[:200]:
+                        raise rdtest.TestFailureException(
+                            f"Disassembly of {stage} at event {a.eventId} failed: {disasm[:200]}")
+                    count += 1
+
+        rdtest.log.success(f"Disassembled {count} shaders")
+
+    def flatten_actions(self, actions):
+        ret = []
+        for a in actions:
+            ret.append(a)
+            ret += self.flatten_actions(a.children)
+        return ret
 
     def check_no_validation(self, what):
         msgs = [m for m in self.controller.GetDebugMessages()

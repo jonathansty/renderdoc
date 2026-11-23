@@ -2775,7 +2775,7 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
 
   // check for a descriptor buffer
   // (or a descriptor heap, which is decoded the same way but with different descriptor sizes)
-  if(WrappedVkBuffer::IsAlloc(rm->GetResource(descriptorStore)) &&
+  if(rm->HasResource(descriptorStore) && WrappedVkBuffer::IsAlloc(rm->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
@@ -2980,7 +2980,8 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
 
   // check for a descriptor buffer
   // (or a descriptor heap, which is decoded the same way but with different descriptor sizes)
-  if(WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
+  if(GetResourceManager()->HasResource(descriptorStore) &&
+     WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
@@ -3665,7 +3666,8 @@ rdcarray<DescriptorLogicalLocation> VulkanReplay::GetDescriptorLocations(
 
   // descriptor heaps are named by index. There's no fixed element size in a heap (shaders index it
   // with a stride of the size of the type being accessed) so we use the stride the caller gave us
-  if(WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
+  if(GetResourceManager()->HasResource(descriptorStore) &&
+     WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
      (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
       VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT) != 0)
   {
@@ -3709,7 +3711,8 @@ rdcarray<DescriptorLogicalLocation> VulkanReplay::GetDescriptorLocations(
   if(m_pDriver->m_CreationInfo.m_DescSetLayout.find(descriptorStore) !=
          m_pDriver->m_CreationInfo.m_DescSetLayout.end() ||
      m_pDriver->m_InlineBuffers.find(descriptorStore) != m_pDriver->m_InlineBuffers.end() ||
-     (WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
+     (GetResourceManager()->HasResource(descriptorStore) &&
+     WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
       (m_pDriver->m_CreationInfo.m_Buffer[descriptorStore].usage &
        (VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
         VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)) != 0))

@@ -140,6 +140,17 @@ static rdcstr EscapeString(const rdcstr &ret)
 
 namespace rdcspv
 {
+// skip instructions that can sit between a block terminator and the next label without being part of
+// either: debug line info, and non-semantic extended instructions such as
+// NonSemantic.Shader.DebugInfo.100 DebugNoScope (emitted by e.g. Slang). A regular OpExtInst can't
+// appear outside a block so it is safe to skip any.
+static ConstIter SkipLineAndDebugInstructions(ConstIter it)
+{
+  while(it.opcode() == Op::Line || it.opcode() == Op::NoLine || it.opcode() == Op::ExtInst)
+    it++;
+  return it;
+}
+
 rdcstr Reflector::Disassemble(const rdcstr &entryPoint, const rdcarray<SpecConstant> &specInfo,
                               std::map<size_t, uint32_t> &instructionLines) const
 {
@@ -819,8 +830,7 @@ rdcstr Reflector::Disassemble(const rdcstr &entryPoint, const rdcarray<SpecConst
 
             ConstIter nextit = it;
             nextit++;
-            while(nextit.opcode() == Op::Line || nextit.opcode() == Op::NoLine)
-              nextit++;
+            nextit = SkipLineAndDebugInstructions(nextit);
 
             // if we got here we're a simple if() without an else - SelectionMerge/LoopMerge
             // consumes any branch
@@ -909,8 +919,7 @@ rdcstr Reflector::Disassemble(const rdcstr &entryPoint, const rdcarray<SpecConst
             {
               ConstIter nextit = it;
               nextit++;
-              while(nextit.opcode() == Op::Line || nextit.opcode() == Op::NoLine)
-                nextit++;
+              nextit = SkipLineAndDebugInstructions(nextit);
 
               // we can now ignore everything between us and the label of this branch, which is
               // almost always going to be the very next label.
@@ -1096,8 +1105,7 @@ rdcstr Reflector::Disassemble(const rdcstr &entryPoint, const rdcarray<SpecConst
 
           ConstIter nextit = it;
           nextit++;
-          while(nextit.opcode() == Op::Line || nextit.opcode() == Op::NoLine)
-            nextit++;
+          nextit = SkipLineAndDebugInstructions(nextit);
 
           // next opcode *must* be a label because this is the end of a block, unless there are no more blocks
           Id decodedlabelId;
