@@ -30,6 +30,7 @@
 #include "replay/common/var_dispatch_helpers.h"
 #include "vk_core.h"
 #include "vk_debug.h"
+#include "vk_heap_mapping.h"
 #include "vk_replay.h"
 #include "vk_shader_cache.h"
 
@@ -150,6 +151,61 @@ public:
 
     // filter to only accesses from the stage we care about, as access lookups will be stage-specific
     m_Access.removeIf([stage](const DescriptorAccess &access) { return access.stage != stage; });
+
+    // on descriptor heap pipelines and shader objects, resources mapped from set/binding into the
+    // heaps are resolved on demand (see FetchMappedDescriptor) from the shader's mappings, so that
+    // we don't depend on feedback having run or on which array elements it found. Find the shader
+    // for this stage and drop the accesses which refer to the heaps.
+    if(vk->DescriptorHeaps())
+    {
+      const VulkanRenderState &state = vk->GetRenderState();
+      const bool compute = (stage == ShaderStage::Compute);
+
+      if(state.UsesDescriptorHeaps(vk, compute))
+      {
+        const VulkanStatePipeline &pipe = compute ? state.compute : state.graphics;
+
+        if(pipe.shaderObject)
+        {
+          auto it = m_Creation.m_ShaderObject.find(state.shaderObjects[(uint32_t)stage]);
+          if(it != m_Creation.m_ShaderObject.end())
+            m_HeapShader = &it->second.shad;
+        }
+        else
+        {
+          auto it = m_Creation.m_Pipeline.find(pipe.pipeline);
+          if(it != m_Creation.m_Pipeline.end())
+            m_HeapShader = &it->second.shaders[(uint32_t)stage];
+        }
+      }
+
+      if(m_HeapShader)
+      {
+        // snapshot the push data now, it is only meaningful if it was pushed with vkCmdPushDataEXT
+        m_PushDataValid = state.pushDataHeap;
+        m_PushData.resize(RDCMIN((size_t)state.pushConstSize, sizeof(state.pushconsts)));
+        if(!m_PushData.empty())
+          memcpy(m_PushData.data(), state.pushconsts, m_PushData.size());
+
+        ResourceId heapStores[2];
+        uint64_t unused = 0;
+        if(state.resourceHeap.valid)
+          vk->GetResIDFromAddr(state.resourceHeap.address, heapStores[0], unused);
+        if(state.samplerHeap.valid)
+          vk->GetResIDFromAddr(state.samplerHeap.address, heapStores[1], unused);
+
+        m_Access.removeIf([this, &heapStores](const DescriptorAccess &access) {
+          if(access.index == DescriptorAccess::NoShaderBinding)
+            return true;
+          if(access.descriptorStore == ResourceId())
+            return false;
+          if(access.descriptorStore == heapStores[0] || access.descriptorStore == heapStores[1])
+            return true;
+          auto samp = m_Creation.m_Sampler.find(access.descriptorStore);
+          return samp != m_Creation.m_Sampler.end() && samp->second.embedded;
+        });
+      }
+    }
 
     // fetch all descriptor contents now too
     m_Descriptors.reserve(m_Access.size());
@@ -329,6 +385,8 @@ public:
     for(auto it = m_SampleViews.begin(); it != m_SampleViews.end(); it++)
       m_pDriver->vkDestroyImageView(dev, it->second, NULL);
     for(auto it = m_BiasSamplers.begin(); it != m_BiasSamplers.end(); it++)
+      m_pDriver->vkDestroySampler(dev, it->second, NULL);
+    for(auto it = m_EmbeddedSamplers.begin(); it != m_EmbeddedSamplers.end(); it++)
       m_pDriver->vkDestroySampler(dev, it->second, NULL);
   }
 
@@ -1077,9 +1135,14 @@ public:
         auto insertIt = m_BiasSamplers.insert(std::make_pair(key, VkSampler()));
         if(insertIt.second)
         {
+          // samplers we created for embedded heap samplers have no creation info of their own
+          ResourceId propsId = key.first;
+          auto embeddedIt = m_EmbeddedSamplerInfo.find(propsId);
+          if(embeddedIt != m_EmbeddedSamplerInfo.end())
+            propsId = embeddedIt->second;
+
           const VulkanCreationInfo::Sampler &samplerProps =
-              (sampler == VK_NULL_HANDLE) ? defaultSamplerProps
-                                          : m_Creation.GetSamplerInfo(key.first);
+              (sampler == VK_NULL_HANDLE) ? defaultSamplerProps : m_Creation.GetSamplerInfo(propsId);
 
           VkSamplerCreateInfo sampInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
           sampInfo.magFilter = samplerProps.magFilter;
@@ -1995,6 +2058,277 @@ private:
     return true;
   }
 
+  // for descriptor heap pipelines/shader objects, the shader of the stage being debugged. Resources
+  // mapped from set/binding into the heaps are resolved from its descriptor mappings, using the
+  // push data and heaps bound at the event
+  const VulkanCreationInfo::ShaderEntry *m_HeapShader = NULL;
+  bytebuf m_PushData;
+  bool m_PushDataValid = false;
+
+  // descriptors resolved from mappings by the binding from the debugger. A combined image sampler
+  // has both an image and a sampler descriptor under the same bind
+  std::map<ShaderBindIndex, Descriptor> m_MappedDescriptors;
+  std::map<ShaderBindIndex, SamplerDescriptor> m_MappedSamplerDescriptors;
+
+  // real samplers created for the embedded samplers of mappings, by mapping index, and the fake id
+  // that has their creation info (in the creation info) by the id of the sampler we created
+  std::map<uint32_t, VkSampler> m_EmbeddedSamplers;
+  std::map<ResourceId, ResourceId> m_EmbeddedSamplerInfo;
+
+  enum class MappedResult
+  {
+    // not a binding we can resolve through a mapping, fall back to the descriptor access
+    NotMapped,
+    // we should resolve this through a mapping but couldn't, an error was reported
+    Failed,
+    Ok,
+  };
+
+  VkSampler CreateEmbeddedSampler(uint32_t mappingIndex)
+  {
+    auto it = m_EmbeddedSamplers.find(mappingIndex);
+    if(it != m_EmbeddedSamplers.end())
+      return it->second;
+
+    const VulkanCreationInfo::ShaderEntry::DescriptorMapping &mapping =
+        m_HeapShader->descriptorMappings[mappingIndex];
+
+    // reconstruct the create info of the embedded sampler from what we stored
+    VkSamplerCreateInfo sampInfo = mapping.sampler;
+    sampInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampInfo.pNext = NULL;
+
+    const VulkanCreationInfo::Sampler &props = m_Creation.GetSamplerInfo(mapping.samplerId);
+
+    VkSamplerReductionModeCreateInfo reductionInfo = {
+        VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
+    if(props.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE)
+    {
+      reductionInfo.reductionMode = props.reductionMode;
+      reductionInfo.pNext = sampInfo.pNext;
+      sampInfo.pNext = &reductionInfo;
+    }
+
+    VkSamplerYcbcrConversionInfo ycbcrInfo = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
+    if(mapping.ycbcr != ResourceId())
+    {
+      ycbcrInfo.conversion =
+          m_pDriver->GetResourceManager()->GetHandle<VkSamplerYcbcrConversion>(mapping.ycbcr);
+      ycbcrInfo.pNext = sampInfo.pNext;
+      sampInfo.pNext = &ycbcrInfo;
+    }
+
+    // a regular sampler only needs the border colour itself, not the registered index that the
+    // heap needs
+    VkSamplerCustomBorderColorCreateInfoEXT borderInfo = mapping.borderColor;
+    if(mapping.hasBorderColor)
+    {
+      borderInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
+      borderInfo.pNext = sampInfo.pNext;
+      sampInfo.pNext = &borderInfo;
+    }
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkResult vkr = m_pDriver->vkCreateSampler(m_pDriver->GetDev(), &sampInfo, NULL, &sampler);
+    CHECK_VKR(m_pDriver, vkr);
+
+    m_EmbeddedSamplers[mappingIndex] = sampler;
+    m_EmbeddedSamplerInfo[GetResID(sampler)] = mapping.samplerId;
+
+    return sampler;
+  }
+
+  // fetches a sampler descriptor from either the sampler heap, or from an embedded sampler of the
+  // mapping
+  bool FetchMappedSampler(const rdcstr &access, HeapMappingKind kind, uint64_t byteOffset,
+                          uint32_t mappingIndex, SamplerDescriptor &out)
+  {
+    VulkanReplay *replay = m_pDriver->GetReplay();
+
+    DescriptorRange range;
+    range.count = 1;
+    range.type = DescriptorType::Sampler;
+
+    if(kind == HeapMappingKind::EmbeddedSampler)
+    {
+      if(mappingIndex >= m_HeapShader->descriptorMappings.size())
+        return false;
+
+      const VulkanCreationInfo::ShaderEntry::DescriptorMapping &mapping =
+          m_HeapShader->descriptorMappings[mappingIndex];
+
+      range.offset = 0;
+      range.descriptorSize = 1;
+
+      rdcarray<SamplerDescriptor> samps = replay->GetSamplerDescriptors(mapping.samplerId, {range});
+      if(!samps.empty())
+        out = samps[0];
+
+      // there is no sampler object for an embedded sampler, we need a real one to sample with
+      out.object = GetResID(CreateEmbeddedSampler(mappingIndex));
+      return true;
+    }
+
+    if(kind != HeapMappingKind::SamplerHeap)
+      return false;
+
+    if(m_SamplerHeap.store == ResourceId())
+    {
+      m_pDriver->AddDebugMessage(
+          MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("No sampler heap bound for mapped sampler at byte offset %llu when %s.",
+                            byteOffset, access.c_str()));
+      return false;
+    }
+
+    range.offset = uint32_t(m_SamplerHeap.offset + byteOffset);
+    range.descriptorSize = m_pDriver->HeapDescriptorSize(VK_DESCRIPTOR_TYPE_SAMPLER);
+
+    rdcarray<SamplerDescriptor> samps = replay->GetSamplerDescriptors(m_SamplerHeap.store, {range});
+    if(!samps.empty())
+      out = samps[0];
+
+    return true;
+  }
+
+  // resolves a binding of a shader on a heap pipeline through the shader's set/binding mappings
+  // (see ResolveHeapMapping), and fetches the descriptors it points to
+  MappedResult FetchMappedDescriptor(const rdcstr &access, const ShaderBindIndex &index)
+  {
+    CHECK_DEVICE_THREAD();
+
+    if(m_MappedDescriptors.find(index) != m_MappedDescriptors.end())
+      return MappedResult::Ok;
+
+    const ShaderReflection *refl = m_HeapShader->refl;
+    if(!refl)
+      return MappedResult::NotMapped;
+
+    uint32_t set = 0, binding = 0;
+    VkSpirvResourceTypeFlagsEXT typeMask = 0;
+    DescriptorType type = DescriptorType::ConstantBuffer;
+
+    switch(index.category)
+    {
+      case DescriptorCategory::ConstantBlock:
+        if(index.index < refl->constantBlocks.size())
+        {
+          const ConstantBlock &b = refl->constantBlocks[index.index];
+          set = b.fixedBindSetOrSpace;
+          binding = b.fixedBindNumber;
+          typeMask = SpirvResourceTypeForBinding(b);
+          type = DescriptorType::ConstantBuffer;
+        }
+        break;
+      case DescriptorCategory::Sampler:
+        if(index.index < refl->samplers.size())
+        {
+          const ShaderSampler &b = refl->samplers[index.index];
+          set = b.fixedBindSetOrSpace;
+          binding = b.fixedBindNumber;
+          typeMask = SpirvResourceTypeForBinding(b);
+          type = DescriptorType::Sampler;
+        }
+        break;
+      case DescriptorCategory::ReadOnlyResource:
+        if(index.index < refl->readOnlyResources.size())
+        {
+          const ShaderResource &b = refl->readOnlyResources[index.index];
+          set = b.fixedBindSetOrSpace;
+          binding = b.fixedBindNumber;
+          typeMask = SpirvResourceTypeForBinding(b);
+          type = b.descriptorType;
+        }
+        break;
+      case DescriptorCategory::ReadWriteResource:
+        if(index.index < refl->readWriteResources.size())
+        {
+          const ShaderResource &b = refl->readWriteResources[index.index];
+          set = b.fixedBindSetOrSpace;
+          binding = b.fixedBindNumber;
+          typeMask = SpirvResourceTypeForBinding(b);
+          type = b.descriptorType;
+        }
+        break;
+      default: break;
+    }
+
+    // push constants and anything else which isn't mappable
+    if(typeMask == 0)
+      return MappedResult::NotMapped;
+
+    const HeapMappingResult res = ResolveHeapMapping(
+        m_HeapShader->descriptorMappings, set, binding, typeMask, index.arrayElement,
+        m_PushDataValid ? m_PushData.data() : NULL, m_PushData.size());
+
+    Descriptor desc;
+    SamplerDescriptor samp;
+
+    if(res.kind == HeapMappingKind::ResourceHeap)
+    {
+      // the image part of a combined image sampler is an image in the heap
+      const DescriptorType heapType =
+          (type == DescriptorType::ImageSampler) ? DescriptorType::Image : type;
+
+      if(m_ResourceHeap.store == ResourceId())
+      {
+        m_pDriver->AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt("No resource heap bound for mapped %s %u[%u] when %s.",
+                              ToStr(index.category).c_str(), index.index, index.arrayElement,
+                              access.c_str()));
+        return MappedResult::Failed;
+      }
+
+      DescriptorRange range;
+      range.offset = uint32_t(m_ResourceHeap.offset + res.byteOffset);
+      range.descriptorSize = m_pDriver->HeapDescriptorSize(MakeVkDescriptorType(heapType, false));
+      range.count = 1;
+      range.type = heapType;
+
+      rdcarray<Descriptor> descs =
+          m_pDriver->GetReplay()->GetDescriptors(m_ResourceHeap.store, {range});
+      if(!descs.empty())
+        desc = descs[0];
+
+      // the sampler part of a combined image sampler comes from the sampler heap or is embedded
+      if(type == DescriptorType::ImageSampler &&
+         !FetchMappedSampler(access, res.samplerKind, res.samplerByteOffset, res.mappingIndex, samp))
+      {
+        m_pDriver->AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt("Couldn't resolve sampler of combined image sampler %u[%u] when %s.",
+                              index.index, index.arrayElement, access.c_str()));
+        return MappedResult::Failed;
+      }
+    }
+    else if(type == DescriptorType::Sampler && (res.kind == HeapMappingKind::SamplerHeap ||
+                                                res.kind == HeapMappingKind::EmbeddedSampler))
+    {
+      if(!FetchMappedSampler(access, res.kind, res.byteOffset, res.mappingIndex, samp))
+        return MappedResult::Failed;
+    }
+    else
+    {
+      // push data/address, heap data and indirect sources can't be resolved to a descriptor yet
+      if(res.kind == HeapMappingKind::None)
+        return MappedResult::NotMapped;
+
+      m_pDriver->AddDebugMessage(
+          MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("The descriptor mapping source of %s %u[%u] is not supported by the "
+                            "shader debugger when %s.",
+                            ToStr(index.category).c_str(), index.index, index.arrayElement,
+                            access.c_str()));
+      return MappedResult::Failed;
+    }
+
+    m_MappedDescriptors[index] = desc;
+    m_MappedSamplerDescriptors[index] = samp;
+
+    return MappedResult::Ok;
+  }
+
   std::map<ResourceId, VkImageView> m_SampleViews;
   struct BufViewKey
   {
@@ -2080,6 +2414,18 @@ private:
       return m_HeapDescriptors[index];
     }
 
+    if(m_HeapShader)
+    {
+      const MappedResult mapped = FetchMappedDescriptor(access, index);
+      if(mapped == MappedResult::Failed)
+      {
+        valid = false;
+        return dummy;
+      }
+      if(mapped == MappedResult::Ok)
+        return m_MappedDescriptors[index];
+    }
+
     int32_t a = m_Access.indexOf(index);
 
     // this should not happen unless the debugging references an array element that we didn't
@@ -2120,6 +2466,18 @@ private:
         return dummy;
       }
       return m_HeapSamplerDescriptors[index];
+    }
+
+    if(m_HeapShader)
+    {
+      const MappedResult mapped = FetchMappedDescriptor(access, index);
+      if(mapped == MappedResult::Failed)
+      {
+        valid = false;
+        return dummy;
+      }
+      if(mapped == MappedResult::Ok)
+        return m_MappedSamplerDescriptors[index];
     }
 
     int32_t a = m_Access.indexOf(index);
@@ -5722,23 +6080,6 @@ VkSpecializationInfo VulkanReplay::MakeSpecInfo(SpecData &specData, VkSpecializa
   return ret;
 }
 
-// shaders on descriptor heap pipelines can be debugged when they access the heaps directly
-// (SPV_EXT_descriptor_heap), but resources mapped from set/binding into the heaps can't be resolved
-// by the debugger yet. Push constants (push data) are fine.
-static bool UsesHeapMappedBindings(WrappedVulkan *driver, const VulkanRenderState &state,
-                                   bool compute, const ShaderReflection &refl)
-{
-  if(!state.UsesDescriptorHeaps(driver, compute))
-    return false;
-
-  for(const ConstantBlock &cb : refl.constantBlocks)
-    if(cb.bufferBacked)
-      return true;
-
-  return !refl.readOnlyResources.empty() || !refl.readWriteResources.empty() ||
-         !refl.samplers.empty();
-}
-
 ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
                                             uint32_t idx, uint32_t view)
 {
@@ -5784,13 +6125,6 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
   if(!shadRefl.refl->debugInfo.debuggable)
   {
     RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
-    return new ShaderDebugTrace();
-  }
-
-  // TODO(heap): resources mapped from set/binding into descriptor heaps
-  if(UsesHeapMappedBindings(m_pDriver, state, false, *shadRefl.refl))
-  {
-    RDCWARN("Vertex debugging is not supported with set/binding mapped descriptor heap resources");
     return new ShaderDebugTrace();
   }
 
@@ -6338,13 +6672,6 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
   if(!shadRefl.refl->debugInfo.debuggable)
   {
     RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
-    return new ShaderDebugTrace();
-  }
-
-  // TODO(heap): resources mapped from set/binding into descriptor heaps
-  if(UsesHeapMappedBindings(m_pDriver, state, false, *shadRefl.refl))
-  {
-    RDCWARN("Pixel debugging is not supported with set/binding mapped descriptor heap resources");
     return new ShaderDebugTrace();
   }
 
@@ -6931,14 +7258,6 @@ ShaderDebugTrace *VulkanReplay::DebugComputeCommon(ShaderStage stage, uint32_t e
   if(!shadRefl.refl->debugInfo.debuggable)
   {
     RDCLOG("Shader is not debuggable: %s", shadRefl.refl->debugInfo.debugStatus.c_str());
-    return new ShaderDebugTrace();
-  }
-
-  // TODO(heap): resources mapped from set/binding into descriptor heaps
-  if(UsesHeapMappedBindings(m_pDriver, state, stage == ShaderStage::Compute, *shadRefl.refl))
-  {
-    RDCWARN("%s debugging is not supported with set/binding mapped descriptor heap resources",
-            ToStr(stage).c_str());
     return new ShaderDebugTrace();
   }
 

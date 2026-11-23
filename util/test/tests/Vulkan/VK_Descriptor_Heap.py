@@ -132,17 +132,35 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
             rdtest.log.success(f"Heap Test {test} output is as expected")
 
-            # resources mapped from set/binding into the heaps can't be resolved by the shader debugger
-            # yet, so pixel debugging must be refused rather than producing wrong results
-            fx, fy, _ = checks[0]
-            trace = self.controller.DebugPixel(int(v.x + v.width * fx), int(v.y + v.height * fy),
-                                               rd.DebugPixelInputs())
-            if trace.debugger is not None:
-                self.controller.FreeTrace(trace)
-                raise rdtest.TestFailureException(f"Heap Test {test} pixel debugging should not be supported")
-            self.controller.FreeTrace(trace)
+            # the shader debugger resolves the resources mapped from set/binding into the heaps (including the
+            # embedded and custom border colour samplers), and must produce the same output as the real draw
+            for fx, fy, _ in checks:
+                self.check_debug_pixel(int(v.x + v.width * fx), int(v.y + v.height * fy))
+
+            if test == 0:
+                self.check_mapped_vertex_debug()
+
+            self.check_no_validation(f"Heap Test {test} debugging")
 
             rdtest.log.end_section(f"Heap Test {test}")
+
+    def check_mapped_vertex_debug(self):
+        """Debug the vertices of the current draw (Heap Test 0), whose vertex shader has no resources but is
+        a graphics pipeline using descriptor heaps"""
+        positions = [(-1.0, 1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)]
+
+        for vtx in range(4):
+            with self.debug_vertex(vtx, 0, vtx, 0) as debug:
+                cycles, variables = self.process_trace(debug.trace)
+
+                pos_var = self.find_output_source_var(debug.trace, rd.ShaderBuiltin.Position)
+                pos = list(self.evaluate_source_var(pos_var, variables).value.f32v[0:4])
+
+                expected = [positions[vtx][0], positions[vtx][1], 0.0, 1.0]
+                if not rdtest.value_compare(pos, expected, eps=1.0E-5):
+                    raise rdtest.TestFailureException(f"Vertex {vtx} debugged position {pos}, expected {expected}")
+
+                rdtest.log.success(f"Vertex {vtx} debugged in {cycles} cycles, position {pos} as expected")
 
     def heap_draws(self):
         """The heap graphics draws used by the overlay and pixel history checks, as (marker, action)"""
@@ -769,6 +787,9 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_pixel_value(out, int(v.x + v.width * 0.5), int(v.y + v.height * 0.5), (0.75, 0.5, 0.5, 1.0),
                                eps=0.02)
+
+        # debugging resolves every array element used from the mappings: the indexing is dynamic in the shader
+        self.check_debug_pixel(int(v.x + v.width * 0.5), int(v.y + v.height * 0.5))
 
         self.check_no_validation("mapped array draw")
 
