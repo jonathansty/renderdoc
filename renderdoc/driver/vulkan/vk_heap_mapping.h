@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <functional>
 #include "vk_info.h"
 
 // Resolver for VkShaderDescriptorSetAndBindingMappingInfoEXT: given a set/binding/resource type
@@ -46,6 +47,10 @@ enum class HeapMappingKind
   // buffer/AS backed by an address in push data, byteOffset is the offset into push data of the
   // address and 'address' is the address itself if push data was available
   PushAddress,
+  // buffer/AS backed by an address read through an address in push data (INDIRECT_ADDRESS),
+  // byteOffset is the offset into push data of the indirect address. 'address' is the resource's
+  // address, which is only valid if the memory could be read
+  IndirectAddress,
   // a uniform buffer backed directly by resource heap *data* (not a descriptor), byteOffset is the
   // offset into the resource heap
   HeapData,
@@ -69,6 +74,11 @@ struct HeapMappingResult
   uint64_t samplerByteOffset = 0;
 };
 
+// reads size bytes of device memory at an address, returning false if that wasn't possible. The
+// indirect sources (INDIRECT_INDEX, INDIRECT_INDEX_ARRAY and INDIRECT_ADDRESS) read through
+// addresses from push data, so can only be resolved if the caller can supply memory reads
+typedef std::function<bool(uint64_t address, void *data, size_t size)> HeapMemoryReader;
+
 // the VkSpirvResourceTypeFlagBitsEXT mask a reflected binding corresponds to. Reflection does not
 // distinguish NonWritable storage buffers/images so read-write bindings return both the read-only
 // and read-write bits (a mapping matches if it overlaps any bit). Returns 0 for things which can't
@@ -86,8 +96,9 @@ const VulkanCreationInfo::ShaderEntry::DescriptorMapping *FindHeapMapping(
     uint32_t binding, VkSpirvResourceTypeFlagsEXT type, uint32_t *mappingIndex = NULL);
 
 // find and resolve the mapping for a binding. pushData can be NULL if not available, in which case
-// push-data-dependent sources return Unresolved.
+// push-data-dependent sources return Unresolved. If readMemory is not set the indirect sources
+// return Unresolved, as do shader record sources.
 HeapMappingResult ResolveHeapMapping(
     const rdcarray<VulkanCreationInfo::ShaderEntry::DescriptorMapping> &mappings, uint32_t set,
     uint32_t binding, VkSpirvResourceTypeFlagsEXT type, uint32_t arrayIndex, const byte *pushData,
-    size_t pushDataSize);
+    size_t pushDataSize, const HeapMemoryReader &readMemory = HeapMemoryReader());

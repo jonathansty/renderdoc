@@ -4748,6 +4748,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
     VulkanCreationInfo::pushConstantDescriptorStorage = ResourceIDGen::GetNewUniqueID();
     VulkanCreationInfo::heapMappedStorage = ResourceIDGen::GetNewUniqueID();
+    VulkanCreationInfo::heapSynthesisedStorage = ResourceIDGen::GetNewUniqueID();
     VulkanCreationInfo::descriptorSetStorage.resize(
         m_PhysicalDeviceData.props.limits.maxBoundDescriptorSets);
     for(size_t i = 0; i < VulkanCreationInfo::descriptorSetStorage.size(); i++)

@@ -33,6 +33,7 @@ RDOC_EXTERN_CONFIG(rdcarray<rdcstr>, DXBC_Debug_SearchDirPaths);
 
 ResourceId VulkanCreationInfo::pushConstantDescriptorStorage;
 ResourceId VulkanCreationInfo::heapMappedStorage;
+ResourceId VulkanCreationInfo::heapSynthesisedStorage;
 rdcarray<ResourceId> VulkanCreationInfo::descriptorSetStorage;
 rdcarray<ResourceId> VulkanCreationInfo::descriptorBufferStorage;
 rdcarray<ResourceId> VulkanCreationInfo::inlineBufferStorage;

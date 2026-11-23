@@ -921,6 +921,10 @@ struct VulkanCreationInfo
   // the fake ID of the placeholder store for set/binding resources mapped to descriptor heaps,
   // resolved to the real heap and offset when querying descriptor access at an event
   static ResourceId heapMappedStorage;
+  // the fake ID of the store of descriptors synthesised at an event for heap mappings which don't
+  // refer to a descriptor in a heap (buffers at an address, heap data, combined image samplers),
+  // see VulkanReplay::GetDescriptorAccess
+  static ResourceId heapSynthesisedStorage;
   // fake IDs for each set/buffer
   static rdcarray<ResourceId> descriptorSetStorage;
   static rdcarray<ResourceId> descriptorBufferStorage;

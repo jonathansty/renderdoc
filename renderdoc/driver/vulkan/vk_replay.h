@@ -376,6 +376,14 @@ public:
   rdcarray<SamplerDescriptor> GetSamplerDescriptors(ResourceId descriptorStore,
                                                     const rdcarray<DescriptorRange> &ranges);
   rdcarray<DescriptorAccess> GetDescriptorAccess(uint32_t eventId);
+
+  // reads device memory at an address, for resolving descriptor heap mappings which read through
+  // addresses in push data. Returns false if the address isn't in a known buffer or is out of range
+  bool ReadDeviceMemory(uint64_t address, void *data, size_t size);
+  // fills in a descriptor for a buffer at an address, as used by heap mappings which don't point to
+  // a descriptor. byteSize is clamped to the buffer's size (and 0 means to the end of the buffer)
+  bool MakeAddressDescriptor(DescriptorType type, uint64_t address, uint64_t byteSize,
+                             Descriptor &out);
   rdcarray<DescriptorLogicalLocation> GetDescriptorLocations(ResourceId descriptorStore,
                                                              const rdcarray<DescriptorRange> &ranges);
   void FreeTargetResource(ResourceId id);
@@ -884,6 +892,17 @@ private:
   } m_PatchedShaderFeedback;
 
   std::map<uint32_t, VKDynamicShaderFeedback> m_BindlessFeedback;
+
+  // descriptors synthesised by GetDescriptorAccess for heap mappings with no descriptor in a heap.
+  // The access has VulkanCreationInfo::heapSynthesisedStorage as the store and an index into this
+  // array as its byte offset
+  struct SynthesisedDescriptor
+  {
+    Descriptor descriptor;
+    SamplerDescriptor sampler;
+    rdcstr name;
+  };
+  rdcarray<SynthesisedDescriptor> m_SynthesisedDescriptors;
 
   ShaderDebugData m_ShaderDebugData;
 

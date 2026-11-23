@@ -54,6 +54,8 @@ class VK_Descriptor_Heap(rdtest.TestCase):
 
         self.check_mapped_array_accesses()
 
+        self.check_mapped_sources()
+
         self.check_direct_heap_access()
 
         self.check_direct_heap_dynamic()
@@ -794,6 +796,207 @@ class VK_Descriptor_Heap(rdtest.TestCase):
         self.check_no_validation("mapped array draw")
 
         rdtest.log.success("Heap Array Draw output is as expected")
+
+    def check_mapped_sources(self):
+        """The other sources of set/binding mappings: push data, push address, resource heap data, indirect index,
+        indirect index array, indirect address and combined image samplers (with constant offsets and a packed push
+        index). Each is its own draw in the demo. Uniform buffers backed by push data are reported with the push
+        constants store at an offset, buffers and combined image samplers which have no single descriptor in a heap
+        are reported with a synthesised descriptor"""
+        layout_action = self.find_action("Heap Source Layout:")
+
+        if layout_action is None:
+            raise rdtest.TestFailureException("Couldn't find the heap source layout marker")
+
+        layout = {}
+        for item in layout_action.customName.split(":")[1].split():
+            k, v = item.split("=")
+            layout[k] = int(v)
+
+        img_stride = layout['imgStride']
+
+        frag = rd.ShaderStage.Fragment
+        cbuffer = rd.DescriptorType.ConstantBuffer
+        image = rd.DescriptorType.Image
+        sampler = rd.DescriptorType.Sampler
+        combined = rd.DescriptorType.ImageSampler
+        ssbo_types = (rd.DescriptorType.Buffer, rd.DescriptorType.ReadWriteBuffer)
+
+        white = (1.0, 1.0, 1.0, 1.0)
+
+        # each draw's output colours as (x fraction, y fraction, colour) within its viewport. The combined image
+        # samplers scale the UVs by 2 so the upper right of the viewport is the sampler's white border colour
+        #
+        # also the expected accesses as (type, array element, where, byte offset, resource name), where 'where' is
+        # the resource/sampler heap, or for the push constants and synthesised descriptors the descriptor location's
+        # name. The offset of synthesised descriptors is just a table index so is not checked (None)
+        draws = [
+            ("Heap Source PushData", [(0.5, 0.5, (1.0, 0.5, 0.0, 1.0))],
+             [(cbuffer, 0, "Push constants", layout['pushData'], 'push')]),
+            ("Heap Source PushAddress", [(0.5, 0.5, (0.5, 0.0, 1.0, 1.0))],
+             [(cbuffer, 0, "Push Address", None, 'pushAddrBuf')]),
+            ("Heap Source HeapData", [(0.5, 0.5, (0.5, 1.0, 0.5, 1.0))],
+             [(cbuffer, 0, "Heap Data", None, 'resHeap')]),
+            ("Heap Source IndirectIndex", [(0.5, 0.5, (0.0, 0.5, 1.0, 1.0))],
+             [(image, 0, 'res', layout['indTex'] + img_stride * layout['index'], 'indTex1'),
+              (sampler, 0, 'samp', 0, None)]),
+            # element 0 reads image 2 and element 1 image 0, the sum of both is the output
+            ("Heap Source IndirectIndexArray", [(0.5, 0.5, (0.25, 0.25, 0.25, 1.0))],
+             [(image, 0, 'res', layout['indTex'] + img_stride * layout['array0'], 'indTex2'),
+              (image, 1, 'res', layout['indTex'] + img_stride * layout['array1'], 'indTex0'),
+              (sampler, 0, 'samp', 0, None)]),
+            ("Heap Source IndirectAddress", [(0.5, 0.5, (1.0, 0.0, 0.5, 1.0))],
+             [('ssbo', 0, "Indirect Address", None, 'indAddrSsbo')]),
+            ("Heap Source Combined", [(0.25, 0.25, (0.75, 0.75, 0.0, 1.0)), (0.75, 0.75, white)],
+             [(combined, 0, "Combined Image Sampler", None, 'combTex')]),
+            ("Heap Source CombinedPacked", [(0.25, 0.25, (0.0, 0.75, 0.75, 1.0)), (0.75, 0.75, white)],
+             [(combined, 0, "Combined Image Sampler", None, 'packedTex1')]),
+        ]
+
+        eid = layout_action.eventId
+
+        for name, checks, expected in draws:
+            draw = self.find_action(name, eid)
+
+            if draw is None:
+                raise rdtest.TestFailureException(f"Couldn't find marker for {name}")
+
+            rdtest.log.begin_section(name)
+
+            eid = draw.eventId
+
+            self.controller.GetDebugMessages()
+
+            # selecting the event runs bindless feedback on the draw, which finds the array elements
+            self.set_event(draw.nextAction.eventId, False)
+
+            pipe = self.controller.GetVulkanPipelineState()
+            heaps = {'res': pipe.resourceHeap.buffer, 'samp': pipe.samplerHeap.buffer}
+
+            got = []
+            details = []
+            for a in self.controller.GetDescriptorAccess():
+                if a.index == rd.DescriptorAccess.NoShaderBinding:
+                    continue
+
+                # push constants (including the leftover compute pipeline's) are not mapped
+                if a.type == cbuffer and not self.controller.GetPipelineState().GetShaderReflection(
+                        a.stage).constantBlocks[a.index].bufferBacked:
+                    continue
+
+                if a.stage != frag:
+                    raise rdtest.TestFailureException(f"{name}: unexpected stage {a.stage} for access")
+
+                if a.descriptorStore == rd.ResourceId():
+                    raise rdtest.TestFailureException(f"{name}: access {a.type} {a.index} has no store")
+
+                r = rd.DescriptorRange(a)
+
+                where = [k for k, v in heaps.items() if v == a.descriptorStore]
+                if where:
+                    where = where[0]
+                else:
+                    where = self.controller.GetDescriptorLocations(a.descriptorStore, [r])[0].logicalBindName
+
+                desc = None
+                samp = None
+                res = None
+
+                if a.type == sampler:
+                    samp = self.controller.GetSamplerDescriptors(a.descriptorStore, [r])[0]
+                else:
+                    desc = self.controller.GetDescriptors(a.descriptorStore, [r])[0]
+
+                    if where == "Push constants":
+                        res = 'push'
+                    elif desc.resource != rd.ResourceId():
+                        res = self.get_resource(desc.resource).name
+
+                    if a.type == combined:
+                        samp = self.controller.GetSamplerDescriptors(a.descriptorStore, [r])[0]
+
+                typ = 'ssbo' if a.type in ssbo_types else a.type
+                offset = a.byteOffset if where in ('res', 'samp', "Push constants") else None
+
+                got.append((typ, a.arrayElement, where, offset, res))
+                details.append((a, where, desc, samp))
+
+            if sorted(got, key=str) != sorted(expected, key=str):
+                raise rdtest.TestFailureException(
+                    f"{name}: mapped accesses don't match. Got: {sorted(got, key=str)} "
+                    f"Expected: {sorted(expected, key=str)}")
+
+            rdtest.log.success(f"{name} reported the expected {len(got)} mapped accesses")
+
+            # check the contents of the descriptors in more detail
+            for a, where, desc, samp in details:
+                if name == "Heap Source PushData":
+                    # the push constants store is queried at an offset, and the viewed data is the rest of the push
+                    # data from there
+                    if not (desc.flags & rd.DescriptorFlags.InlineData) or desc.byteOffset != layout['pushData']:
+                        raise rdtest.TestFailureException(f"{name}: unexpected descriptor {desc.flags} {desc.byteOffset}")
+                    if desc.byteSize < 16:
+                        raise rdtest.TestFailureException(f"{name}: unexpected descriptor size {desc.byteSize}")
+                    self.check_source_buffer(name, desc, (1.0, 0.5, 0.0, 1.0))
+                elif name == "Heap Source PushAddress":
+                    # the buffer is at a non-zero offset, and the descriptor is the size the shader declares
+                    if desc.type != cbuffer or desc.byteOffset != layout['pushAddressBuf'] or desc.byteSize != 16:
+                        raise rdtest.TestFailureException(
+                            f"{name}: unexpected descriptor {desc.type} {desc.byteOffset} {desc.byteSize}")
+                    self.check_source_buffer(name, desc, (0.5, 0.0, 1.0, 1.0))
+                elif name == "Heap Source HeapData":
+                    # the data is in the resource heap buffer itself, at the heap offset plus the push data value
+                    if (desc.type != cbuffer or desc.byteOffset != layout['heapData'] + layout['heapDataPush'] or
+                            desc.byteSize != 16):
+                        raise rdtest.TestFailureException(
+                            f"{name}: unexpected descriptor {desc.type} {desc.byteOffset} {desc.byteSize}")
+                    self.check_source_buffer(name, desc, (0.5, 1.0, 0.5, 1.0))
+                elif name == "Heap Source IndirectAddress":
+                    # the whole 0x100 byte buffer is visible
+                    if desc.type not in ssbo_types or desc.byteOffset != 0 or desc.byteSize != 0x100:
+                        raise rdtest.TestFailureException(
+                            f"{name}: unexpected descriptor {desc.type} {desc.byteOffset} {desc.byteSize}")
+                    self.check_source_buffer(name, desc, (1.0, 0.0, 0.5, 1.0))
+                elif name in ("Heap Source Combined", "Heap Source CombinedPacked"):
+                    # the sampler half is reported with the image half, and is the white border sampler in both. For
+                    # the packed case sampler 0 would clamp to the edge instead
+                    border = [round(x, 2) for x in samp.borderColorValue.floatValue]
+                    if (desc.type != combined or samp.filter.minify != rd.FilterMode.Point or
+                            samp.addressU != rd.AddressMode.ClampBorder or border != list(white)):
+                        raise rdtest.TestFailureException(
+                            f"{name}: unexpected combined descriptor {desc.type} {samp.filter.minify} "
+                            f"{samp.addressU} {border}")
+                elif name.startswith("Heap Source IndirectIndex"):
+                    if a.type == sampler:
+                        if samp.addressU != rd.AddressMode.ClampEdge:
+                            raise rdtest.TestFailureException(f"{name}: sampler address is {samp.addressU}")
+
+            self.check_no_validation(f"{name} mapped access")
+
+            v = self.controller.GetPipelineState().GetViewport(0)
+            out = self.controller.GetPipelineState().GetOutputTargets()[0].resource
+
+            for fx, fy, col in checks:
+                self.check_pixel_value(out, int(v.x + v.width * fx), int(v.y + v.height * fy), col, eps=0.02)
+
+            rdtest.log.success(f"{name} output is as expected")
+
+            # the debugger resolves the sources itself (reading push data, the indirect memory and the buffers
+            # at addresses) and must produce the same output
+            for fx, fy, _ in checks:
+                self.check_debug_pixel(int(v.x + v.width * fx), int(v.y + v.height * fy))
+
+            self.check_no_validation(f"{name} debugging")
+
+            rdtest.log.end_section(name)
+
+    def check_source_buffer(self, name, desc, expected):
+        """Checks that the first four floats of the buffer a descriptor views are as expected"""
+        data = self.controller.GetBufferData(desc.resource, desc.byteOffset, 16)
+        contents = list(struct.unpack_from("4f", data, 0))
+
+        if not rdtest.value_compare(contents, list(expected), eps=1.0E-5):
+            raise rdtest.TestFailureException(f"{name}: buffer contents are {contents}, expected {expected}")
 
     def check_heap_rebind(self):
         """Heap state changes within one command buffer: rebinding both heaps, only one of them,

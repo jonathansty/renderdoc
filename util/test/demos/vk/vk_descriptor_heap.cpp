@@ -167,7 +167,80 @@ void main()
 
 )EOSHADER";
 
+  // fragment shader for the other sources of set/binding mappings: push data, push address, heap
+  // data, indirect index, indirect index array, indirect address, and combined image samplers. Each
+  // source is a separate pipeline selected by SRC
+  const std::string sourcePixel = R"EOSHADER(
+layout(location = 0) in vec2 uv;
+
+layout(location = 0, index = 0) out vec4 Color;
+
+// uniform buffer in push data
+layout(set = 5, binding = 0, std140) uniform pushdata_block
+{
+  vec4 col;
+} pushdata;
+
+// uniform buffer at an address in push data
+layout(set = 6, binding = 0, std140) uniform pushaddr_block
+{
+  vec4 col;
+} pushaddr;
+
+// uniform buffer in the resource heap's data
+layout(set = 7, binding = 0, std140) uniform heapdata_block
+{
+  vec4 col;
+} heapdata;
+
+// resource heap, index read through an address in push data
+layout(set = 8, binding = 0) uniform texture2D indTex;
+layout(set = 8, binding = 1) uniform sampler indSamp;
+
+// resource heap, an array of indices read through an address in push data
+layout(set = 9, binding = 0) uniform texture2D indTexArr[2];
+layout(set = 9, binding = 1) uniform sampler indArrSamp;
+
+// SSBO at an address read through an address in push data
+layout(set = 10, binding = 0, std430) readonly buffer indaddr_block
+{
+  vec4 col;
+} indaddr;
+
+// combined image sampler at constant offsets in both heaps
+layout(set = 11, binding = 0) uniform sampler2D combined;
+
+// combined image sampler with a packed push index
+layout(set = 12, binding = 0) uniform sampler2D combinedPacked;
+
+void main()
+{
+#if SRC == 0
+  Color = pushdata.col;
+#elif SRC == 1
+  Color = pushaddr.col;
+#elif SRC == 2
+  Color = heapdata.col;
+#elif SRC == 3
+  Color = texture(sampler2D(indTex, indSamp), uv);
+#elif SRC == 4
+  vec3 sum = vec3(0);
+  for(int i = 0; i < 2; i++)
+    sum += texture(sampler2D(indTexArr[i], indArrSamp), uv).rgb;
+  Color = vec4(sum, 1.0f);
+#elif SRC == 5
+  Color = indaddr.col;
+#elif SRC == 6
+  Color = texture(combined, uv*2.0f);
+#elif SRC == 7
+  Color = texture(combinedPacked, uv*2.0f);
+#endif
+}
+
+)EOSHADER";
+
   static const uint32_t NUM_TESTS = 8;
+  static const uint32_t NUM_SOURCES = 8;
 
   // shaders that index the heaps directly with SPV_EXT_descriptor_heap, without any set/binding
   // mappings. These are compiled from Slang (glslang can't generate direct heap access) with:
@@ -2538,8 +2611,9 @@ float4 psmain(V2F IN) : SV_Target0
     // null descriptors are only written if the device supports them, they're optional
     optDevExts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
-    // the array draw is in an extra row below the 4x4 grid of cells (see cellH in the frame)
-    screenHeight = screenHeight * 5 / 4;
+    // the array draw and the mapping source draws are in extra rows below the 4x4 grid of cells
+    // (see cellH in the frame)
+    screenHeight = screenHeight * 7 / 4;
 
     VulkanGraphicsTest::Prepare(argc, argv);
 
@@ -2889,7 +2963,7 @@ float4 psmain(V2F IN) : SV_Target0
     const uint32_t arrSsboOffset = (uint32_t)Align(arrTexOffset + imgStride * 4, 0x100);
     const uint32_t arrSsboBase = 1;
 
-    if(arrSsboOffset + bufStride * 4 > 0x1000)
+    if(arrSsboOffset + bufStride * 4 > 0x800)
     {
       TEST_ERROR("Descriptor sizes are too big to fit the array descriptors");
       return 4;
@@ -2898,6 +2972,43 @@ float4 psmain(V2F IN) : SV_Target0
     // sampler heap offsets
     const uint32_t sampOffset = 0;
     const uint32_t customSampOffset = (uint32_t)Align(sampOffset + sampStride, 0x100);
+
+    // the other mapping sources are in the second half of the area used by the set/binding mapping
+    // tests: images that are selected by indirect indices, a combined image sampler, images and
+    // samplers selected by a packed combined index, then uniform buffer data in the resource heap
+    // itself (at srcHeapDataOffset plus a value in push data). The heap data is a uniform buffer so
+    // its address must be aligned, which the heap buffer's own alignment is bumped to guarantee
+    const uint32_t srcIndTexOffset = 0x800;
+    const uint32_t srcCombImgOffset = (uint32_t)Align(srcIndTexOffset + imgStride * 4, 0x100);
+    const uint32_t srcPackedImgOffset = (uint32_t)Align(srcCombImgOffset + imgStride, 0x100);
+    const uint32_t srcHeapDataOffset = (uint32_t)Align(srcPackedImgOffset + imgStride * 2, 0x100);
+    const uint32_t srcHeapDataPush = 0x100;
+    const uint32_t srcCombSampOffset = (uint32_t)Align(customSampOffset + sampStride, 0x100);
+    const uint32_t srcPackedSampOffset = (uint32_t)Align(srcCombSampOffset + sampStride, 0x100);
+
+    // offsets into push data of the uniform buffer data, and the address for each source
+    const uint32_t srcPushDataOffset = 16;
+    const uint32_t srcPushAddressOffset = 8;
+    // offset of the colour in the push address buffer
+    const uint32_t srcPushAddressBufOffset = 0x100;
+    // the second and third address in push data used by the indirect sources
+    const uint32_t srcIndexArrayPushOffset = 8;
+    const uint32_t srcIndirectAddressPushOffset = 16;
+    // offsets into the indirect buffer: the index (for indirect index), the first of the two
+    // indices (for the array of indices) and the address of the buffer
+    const uint32_t srcIndexOffset = 4;
+    const uint32_t srcIndexArrayOffset = 8;
+    const uint32_t srcAddressOffset = 0x40;
+    // the indices the indirect buffer has: [1] is the index, [2] and [3] are the array of indices
+    const uint32_t srcIndirectIndices[4] = {0xdeadbeef, 1, 2, 0};
+    // packed combined index: image index in the low 20 bits and sampler index in the next 12 bits
+    const uint32_t srcPackedImgIdx = 1, srcPackedSampIdx = 1;
+
+    if(srcHeapDataOffset + srcHeapDataPush + 16 > 0x1000)
+    {
+      TEST_ERROR("Descriptor sizes are too big to fit the mapping source descriptors");
+      return 4;
+    }
 
     // direct heap indexing: descriptors are at index * descriptor size. Images from 0x1000 and
     // buffers from 0x1800 in the resource heap, samplers from 0x1000 in the sampler heap. Each has
@@ -3026,7 +3137,7 @@ float4 psmain(V2F IN) : SV_Target0
         vkh::BufferCreateInfo(resHeapSize, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR |
                                                VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}),
-        (uint32_t)heapProps.resourceHeapAlignment);
+        std::max<uint32_t>((uint32_t)heapProps.resourceHeapAlignment, 0x100));
     setName(resHeap.buffer, "resHeap");
 
     AllocatedBuffer sampHeap(
@@ -3422,6 +3533,62 @@ float4 psmain(V2F IN) : SV_Target0
 
     WriteSamplerDescriptor(sampPtr + customSampOffset, customInfo);
 
+    // resources for the other mapping sources
+    VkDeviceAddress srcPushAddressBuf = 0, srcIndirectBuf = 0;
+    {
+      // images selected by indirect indices: the draw using an index reads image 1, the draw using
+      // an array of indices reads images 2 and 0 which are summed
+      VkImage indTex[4] = {
+          MakeTestImage("indTex0", Vec4f(0.25f, 0.0f, 0.0f, 1.0f)),
+          MakeTestImage("indTex1", Vec4f(0.0f, 0.5f, 1.0f, 1.0f)),
+          MakeTestImage("indTex2", Vec4f(0.0f, 0.25f, 0.25f, 1.0f)),
+          MakeTestImage("indTex3", Vec4f(0.9f, 0.9f, 0.9f, 1.0f)),
+      };
+
+      for(uint32_t i = 0; i < 4; i++)
+        WriteImageDescriptor(resPtr + srcIndTexOffset + imgStride * i, indTex[i],
+                             VK_FORMAT_R8G8B8A8_UNORM);
+
+      // combined image sampler, the sampler clamps to a white border so we can see it's used
+      VkImage combTex = MakeTestImage("combTex", Vec4f(0.75f, 0.75f, 0.0f, 1.0f));
+      WriteImageDescriptor(resPtr + srcCombImgOffset, combTex, VK_FORMAT_R8G8B8A8_UNORM);
+      WriteSamplerDescriptor(sampPtr + srcCombSampOffset, embeddedInfo);
+
+      // packed combined image sampler. Image 0 and sampler 0 aren't used, sampler 1 clamps to a
+      // white border and sampler 0 clamps to the edge
+      VkImage packedTex[2] = {
+          MakeTestImage("packedTex0", Vec4f(0.9f, 0.1f, 0.1f, 1.0f)),
+          MakeTestImage("packedTex1", Vec4f(0.0f, 0.75f, 0.75f, 1.0f)),
+      };
+
+      for(uint32_t i = 0; i < 2; i++)
+        WriteImageDescriptor(resPtr + srcPackedImgOffset + imgStride * i, packedTex[i],
+                             VK_FORMAT_R8G8B8A8_UNORM);
+      WriteSamplerDescriptor(sampPtr + srcPackedSampOffset, sampInfo);
+      WriteSamplerDescriptor(sampPtr + srcPackedSampOffset + sampStride, embeddedInfo);
+
+      // the uniform buffer's data is at a non-zero offset in a bigger buffer
+      std::vector<float> pushAddressData(0x200 / sizeof(float), 0.9f);
+      const float pushAddressCol[4] = {0.5f, 0.0f, 1.0f, 1.0f};
+      memcpy(&pushAddressData[srcPushAddressBufOffset / sizeof(float)], pushAddressCol,
+             sizeof(pushAddressCol));
+      srcPushAddressBuf = MakeDataBuffer("pushAddrBuf", pushAddressData.data(),
+                                         pushAddressData.size() * sizeof(float));
+
+      // the buffer which push data points at for the indirect sources, which has an index, an array
+      // of indices and the address of a storage buffer
+      VkDeviceAddress indAddrSsbo = MakeTestBuffer("indAddrSsbo", Vec4f(1.0f, 0.0f, 0.5f, 1.0f));
+
+      uint32_t indirectData[0x100 / sizeof(uint32_t)] = {};
+      memcpy(indirectData, srcIndirectIndices, sizeof(srcIndirectIndices));
+      memcpy(&indirectData[srcAddressOffset / sizeof(uint32_t)], &indAddrSsbo, sizeof(indAddrSsbo));
+      srcIndirectBuf = MakeDataBuffer("indirectBuf", indirectData, sizeof(indirectData));
+
+      // the uniform buffer's data in the resource heap itself
+      const float heapDataCol[4] = {0.5f, 1.0f, 0.5f, 1.0f};
+      memcpy(resPtr + srcHeapDataOffset + srcHeapDataPush, heapDataCol, sizeof(heapDataCol));
+    }
+
     // mappings from set/binding to the heaps
     VkDescriptorSetAndBindingMappingEXT mappings[7] = {};
     for(VkDescriptorSetAndBindingMappingEXT &m : mappings)
@@ -3567,6 +3734,124 @@ float4 psmain(V2F IN) : SV_Target0
       pipeCreateInfo.stages[1].pNext = &arrMappingInfo;
 
       arrayPipe = createGraphicsPipeline(pipeCreateInfo);
+
+      pipeCreateInfo.stages[1].pNext = NULL;
+    }
+
+    // pipelines for the other sources of mappings
+    VkPipeline sourcePipes[NUM_SOURCES];
+    {
+      VkDescriptorSetAndBindingMappingEXT srcMappings[10] = {};
+      for(VkDescriptorSetAndBindingMappingEXT &m : srcMappings)
+      {
+        m.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT;
+        m.bindingCount = 1;
+      }
+
+      // set 5, binding 0: uniform buffer in push data
+      srcMappings[0].descriptorSet = 5;
+      srcMappings[0].firstBinding = 0;
+      srcMappings[0].resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+      srcMappings[0].source = VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_DATA_EXT;
+      srcMappings[0].sourceData.pushDataOffset = srcPushDataOffset;
+
+      // set 6, binding 0: uniform buffer at an address in push data
+      srcMappings[1].descriptorSet = 6;
+      srcMappings[1].firstBinding = 0;
+      srcMappings[1].resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+      srcMappings[1].source = VK_DESCRIPTOR_MAPPING_SOURCE_PUSH_ADDRESS_EXT;
+      srcMappings[1].sourceData.pushAddressOffset = srcPushAddressOffset;
+
+      // set 7, binding 0: uniform buffer in the resource heap, at an offset from push data
+      srcMappings[2].descriptorSet = 7;
+      srcMappings[2].firstBinding = 0;
+      srcMappings[2].resourceMask = VK_SPIRV_RESOURCE_TYPE_UNIFORM_BUFFER_BIT_EXT;
+      srcMappings[2].source = VK_DESCRIPTOR_MAPPING_SOURCE_RESOURCE_HEAP_DATA_EXT;
+      srcMappings[2].sourceData.heapData.heapOffset = srcHeapDataOffset;
+      srcMappings[2].sourceData.heapData.pushOffset = 0;
+
+      // set 8, binding 0: image with an index read through an address in push data
+      srcMappings[3].descriptorSet = 8;
+      srcMappings[3].firstBinding = 0;
+      srcMappings[3].resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT;
+      srcMappings[3].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT;
+      srcMappings[3].sourceData.indirectIndex.heapOffset = srcIndTexOffset;
+      srcMappings[3].sourceData.indirectIndex.pushOffset = 0;
+      srcMappings[3].sourceData.indirectIndex.addressOffset = srcIndexOffset;
+      srcMappings[3].sourceData.indirectIndex.heapIndexStride = (uint32_t)imgStride;
+
+      // set 8, binding 1: sampler at a constant offset in the sampler heap
+      srcMappings[4].descriptorSet = 8;
+      srcMappings[4].firstBinding = 1;
+      srcMappings[4].resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT;
+      srcMappings[4].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+      srcMappings[4].sourceData.constantOffset.heapOffset = sampOffset;
+
+      // set 9, binding 0: array of images with an array of indices read through an address in push data
+      srcMappings[5].descriptorSet = 9;
+      srcMappings[5].firstBinding = 0;
+      srcMappings[5].resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT;
+      srcMappings[5].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT;
+      srcMappings[5].sourceData.indirectIndexArray.heapOffset = srcIndTexOffset;
+      srcMappings[5].sourceData.indirectIndexArray.pushOffset = srcIndexArrayPushOffset;
+      srcMappings[5].sourceData.indirectIndexArray.addressOffset = srcIndexArrayOffset;
+      srcMappings[5].sourceData.indirectIndexArray.heapIndexStride = (uint32_t)imgStride;
+
+      // set 9, binding 1: sampler at a constant offset in the sampler heap
+      srcMappings[6].descriptorSet = 9;
+      srcMappings[6].firstBinding = 1;
+      srcMappings[6].resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT;
+      srcMappings[6].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+      srcMappings[6].sourceData.constantOffset.heapOffset = sampOffset;
+
+      // set 10, binding 0: storage buffer at an address read through an address in push data
+      srcMappings[7].descriptorSet = 10;
+      srcMappings[7].firstBinding = 0;
+      srcMappings[7].resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_ONLY_STORAGE_BUFFER_BIT_EXT |
+                                    VK_SPIRV_RESOURCE_TYPE_READ_WRITE_STORAGE_BUFFER_BIT_EXT;
+      srcMappings[7].source = VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_ADDRESS_EXT;
+      srcMappings[7].sourceData.indirectAddress.pushOffset = srcIndirectAddressPushOffset;
+      srcMappings[7].sourceData.indirectAddress.addressOffset = srcAddressOffset;
+
+      // set 11, binding 0: combined image sampler at constant offsets in both heaps
+      srcMappings[8].descriptorSet = 11;
+      srcMappings[8].firstBinding = 0;
+      srcMappings[8].resourceMask = VK_SPIRV_RESOURCE_TYPE_COMBINED_SAMPLED_IMAGE_BIT_EXT;
+      srcMappings[8].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT;
+      srcMappings[8].sourceData.constantOffset.heapOffset = srcCombImgOffset;
+      srcMappings[8].sourceData.constantOffset.samplerHeapOffset = srcCombSampOffset;
+
+      // set 12, binding 0: combined image sampler with the image and sampler index packed in one
+      // push data index
+      srcMappings[9].descriptorSet = 12;
+      srcMappings[9].firstBinding = 0;
+      srcMappings[9].resourceMask = VK_SPIRV_RESOURCE_TYPE_COMBINED_SAMPLED_IMAGE_BIT_EXT;
+      srcMappings[9].source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_PUSH_INDEX_EXT;
+      srcMappings[9].sourceData.pushIndex.heapOffset = srcPackedImgOffset;
+      srcMappings[9].sourceData.pushIndex.pushOffset = 0;
+      srcMappings[9].sourceData.pushIndex.heapIndexStride = (uint32_t)imgStride;
+      srcMappings[9].sourceData.pushIndex.useCombinedImageSamplerIndex = VK_TRUE;
+      srcMappings[9].sourceData.pushIndex.samplerHeapOffset = srcPackedSampOffset;
+      srcMappings[9].sourceData.pushIndex.samplerHeapIndexStride = (uint32_t)sampStride;
+
+      VkShaderDescriptorSetAndBindingMappingInfoEXT srcMappingInfo = {
+          VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
+      };
+      srcMappingInfo.mappingCount = ARRAY_COUNT(srcMappings);
+      srcMappingInfo.pMappings = srcMappings;
+
+      pipeCreateInfo.stages[0] =
+          CompileShaderModule(vertex, ShaderLang::glsl, ShaderStage::vert, "main");
+
+      for(uint32_t i = 0; i < NUM_SOURCES; i++)
+      {
+        pipeCreateInfo.stages[1] = CompileShaderModule(
+            "#version 460 core\n#define SRC " + std::to_string(i) + "\n" + sourcePixel,
+            ShaderLang::glsl, ShaderStage::frag, "main");
+        pipeCreateInfo.stages[1].pNext = &srcMappingInfo;
+
+        sourcePipes[i] = createGraphicsPipeline(pipeCreateInfo);
+      }
 
       pipeCreateInfo.stages[1].pNext = NULL;
     }
@@ -3924,8 +4209,9 @@ float4 psmain(V2F IN) : SV_Target0
       vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
 
       const float cellW = float(screenWidth) / 4.0f;
-      // 4x5 cells, the last row is for the array draw
-      const float cellH = float(screenHeight) / 5.0f;
+      // 4x7 cells, the fifth row is for the array draw and the last rows for the draws of the other
+      // mapping sources
+      const float cellH = float(screenHeight) / 7.0f;
 
       for(uint32_t t = 0; t < NUM_TESTS; t++)
       {
@@ -4130,6 +4416,102 @@ float4 psmain(V2F IN) : SV_Target0
         setMarker(cmd, "Heap Array Draw");
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, arrayPipe);
         vkCmdDraw(cmd, 4, 1, 0, 0);
+      }
+
+      // the other sources of mappings, with the original heaps still bound. Each is its own draw in
+      // its own cell, with distinct output colours
+      {
+        setMarker(cmd,
+                  "Heap Source Layout: imgStride=" + std::to_string(imgStride) + " sampStride=" +
+                      std::to_string(sampStride) + " indTex=" + std::to_string(srcIndTexOffset) +
+                      " combImg=" + std::to_string(srcCombImgOffset) +
+                      " combSamp=" + std::to_string(srcCombSampOffset) +
+                      " packedImg=" + std::to_string(srcPackedImgOffset) +
+                      " packedSamp=" + std::to_string(srcPackedSampOffset) +
+                      " heapData=" + std::to_string(srcHeapDataOffset) +
+                      " heapDataPush=" + std::to_string(srcHeapDataPush) +
+                      " pushData=" + std::to_string(srcPushDataOffset) +
+                      " pushAddress=" + std::to_string(srcPushAddressOffset) +
+                      " pushAddressBuf=" + std::to_string(srcPushAddressBufOffset) +
+                      " indexArrayPush=" + std::to_string(srcIndexArrayPushOffset) +
+                      " indirectAddressPush=" + std::to_string(srcIndirectAddressPushOffset) +
+                      " index=" + std::to_string(srcIndirectIndices[srcIndexOffset / 4]) +
+                      " array0=" + std::to_string(srcIndirectIndices[srcIndexArrayOffset / 4]) +
+                      " array1=" + std::to_string(srcIndirectIndices[srcIndexArrayOffset / 4 + 1]) +
+                      " packedImgIdx=" + std::to_string(srcPackedImgIdx) +
+                      " packedSampIdx=" + std::to_string(srcPackedSampIdx));
+
+        uint8_t push[64] = {};
+
+        auto pushBytes = [&](uint32_t size) {
+          VkPushDataInfoEXT pushInfo = {VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT};
+          pushInfo.offset = 0;
+          pushInfo.data.address = push;
+          pushInfo.data.size = size;
+          vkCmdPushDataEXT(cmd, &pushInfo);
+        };
+
+        auto sourceDraw = [&](uint32_t source, const char *marker) {
+          setCell();
+          setMarker(cmd, marker);
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sourcePipes[source]);
+          vkCmdDraw(cmd, 4, 1, 0, 0);
+        };
+
+        // uniform buffer in push data, after some junk
+        {
+          const uint32_t junk[4] = {0xdeadbeef, 0xdeadbeef, 0xdeadbeef, 0xdeadbeef};
+          const float col[4] = {1.0f, 0.5f, 0.0f, 1.0f};
+          memset(push, 0, sizeof(push));
+          memcpy(push, junk, sizeof(junk));
+          memcpy(push + srcPushDataOffset, col, sizeof(col));
+          pushBytes(srcPushDataOffset + sizeof(col));
+          sourceDraw(0, "Heap Source PushData");
+        }
+
+        // uniform buffer at an address in push data
+        {
+          const uint64_t junk = 0xdeadbeefdeadbeefULL;
+          const uint64_t address = srcPushAddressBuf + srcPushAddressBufOffset;
+          memset(push, 0, sizeof(push));
+          memcpy(push, &junk, sizeof(junk));
+          memcpy(push + srcPushAddressOffset, &address, sizeof(address));
+          pushBytes(srcPushAddressOffset + sizeof(address));
+          sourceDraw(1, "Heap Source PushAddress");
+        }
+
+        // uniform buffer in the heap, the push data is the offset from the mapping's heap offset
+        {
+          memset(push, 0, sizeof(push));
+          memcpy(push, &srcHeapDataPush, sizeof(srcHeapDataPush));
+          pushBytes(sizeof(srcHeapDataPush));
+          sourceDraw(2, "Heap Source HeapData");
+        }
+
+        // all the indirect sources read through the same buffer, with an address in push data for
+        // each
+        {
+          const uint64_t addresses[3] = {srcIndirectBuf, srcIndirectBuf, srcIndirectBuf};
+          memset(push, 0, sizeof(push));
+          memcpy(push, addresses, sizeof(addresses));
+          pushBytes(sizeof(addresses));
+
+          sourceDraw(3, "Heap Source IndirectIndex");
+          sourceDraw(4, "Heap Source IndirectIndexArray");
+          sourceDraw(5, "Heap Source IndirectAddress");
+        }
+
+        // combined image sampler at constant offsets
+        sourceDraw(6, "Heap Source Combined");
+
+        // combined image sampler with a packed index
+        {
+          const uint32_t packed = srcPackedImgIdx | (srcPackedSampIdx << 20);
+          memset(push, 0, sizeof(push));
+          memcpy(push, &packed, sizeof(packed));
+          pushBytes(sizeof(packed));
+          sourceDraw(7, "Heap Source CombinedPacked");
+        }
       }
 
       vkCmdEndRenderPass(cmd);

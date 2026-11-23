@@ -123,6 +123,19 @@ static bool ReadPushU64(const byte *pushData, size_t pushDataSize, uint64_t offs
   return true;
 }
 
+// reads an address from push data then a value from memory at that address plus an offset
+template <typename T>
+static bool ReadIndirect(const byte *pushData, size_t pushDataSize,
+                         const HeapMemoryReader &readMemory, uint64_t pushOffset,
+                         uint64_t addressOffset, T &value)
+{
+  uint64_t indirectAddress = 0;
+  if(!readMemory || !ReadPushU64(pushData, pushDataSize, pushOffset & ~7ULL, indirectAddress))
+    return false;
+
+  return readMemory(indirectAddress + addressOffset, &value, sizeof(T));
+}
+
 /*
  * Spec formulas (VK_EXT_descriptor_heap, "Shader Bindings"), all offsets are byte offsets:
  *
@@ -183,7 +196,7 @@ static bool ReadPushU64(const byte *pushData, size_t pushDataSize, uint64_t offs
 HeapMappingResult ResolveHeapMapping(
     const rdcarray<VulkanCreationInfo::ShaderEntry::DescriptorMapping> &mappings, uint32_t set,
     uint32_t binding, VkSpirvResourceTypeFlagsEXT type, uint32_t arrayIndex, const byte *pushData,
-    size_t pushDataSize)
+    size_t pushDataSize, const HeapMemoryReader &readMemory)
 {
   HeapMappingResult ret;
 
@@ -303,12 +316,130 @@ HeapMappingResult ResolveHeapMapping(
     }
     case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_EXT:
     case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT:
+    {
+      // the two sources only differ in how the array index is used: the array form reads one index
+      // per array element and has no array stride
+      const bool isArray =
+          (m.source == VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_INDIRECT_INDEX_ARRAY_EXT);
+
+      uint32_t heapOffset, pushOffset, addressOffset, indexStride, arrayStride;
+      bool useCombined;
+      uint32_t samplerHeapOffset, samplerPushOffset, samplerAddressOffset, samplerIndexStride,
+          samplerArrayStride;
+
+      if(isArray)
+      {
+        const VkDescriptorMappingSourceIndirectIndexArrayEXT &a = src.indirectIndexArray;
+        heapOffset = a.heapOffset;
+        pushOffset = a.pushOffset;
+        addressOffset = a.addressOffset;
+        indexStride = a.heapIndexStride;
+        arrayStride = 0;
+        useCombined = a.useCombinedImageSamplerIndex != VK_FALSE;
+        samplerHeapOffset = a.samplerHeapOffset;
+        samplerPushOffset = a.samplerPushOffset;
+        samplerAddressOffset = a.samplerAddressOffset;
+        samplerIndexStride = a.samplerHeapIndexStride;
+        samplerArrayStride = 0;
+      }
+      else
+      {
+        const VkDescriptorMappingSourceIndirectIndexEXT &a = src.indirectIndex;
+        heapOffset = a.heapOffset;
+        pushOffset = a.pushOffset;
+        addressOffset = a.addressOffset;
+        indexStride = a.heapIndexStride;
+        arrayStride = a.heapArrayStride;
+        useCombined = a.useCombinedImageSamplerIndex != VK_FALSE;
+        samplerHeapOffset = a.samplerHeapOffset;
+        samplerPushOffset = a.samplerPushOffset;
+        samplerAddressOffset = a.samplerAddressOffset;
+        samplerIndexStride = a.samplerHeapIndexStride;
+        samplerArrayStride = a.samplerHeapArrayStride;
+      }
+
+      if(embedded && isSampler)
+      {
+        ret.kind = HeapMappingKind::EmbeddedSampler;
+        break;
+      }
+
+      // the array form indexes the array of indices in memory by the shader index
+      const uint64_t indexOffset = isArray ? shaderIndex * sizeof(uint32_t) : 0;
+
+      const bool packed = isCombined && useCombined;
+
+      uint32_t indirectIndex = 0;
+      const bool ok = ReadIndirect(pushData, pushDataSize, readMemory, pushOffset,
+                                   (addressOffset & ~3U) + indexOffset, indirectIndex);
+
+      uint32_t samplerIndex = 0;
+      bool samplerOk = ok;
+
+      if(packed)
+      {
+        samplerIndex = (indirectIndex >> 20) & 0xFFF;
+        indirectIndex &= 0xFFFFF;
+      }
+      else if(isCombined && !embedded)
+      {
+        samplerOk = ReadIndirect(pushData, pushDataSize, readMemory, samplerPushOffset,
+                                 (samplerAddressOffset & ~3U) + indexOffset, samplerIndex);
+      }
+
+      if(ok)
+      {
+        ret.kind = mainHeap;
+        ret.byteOffset = uint64_t(heapOffset) + uint64_t(indirectIndex) * indexStride +
+                         (isArray ? 0 : shaderIndex * arrayStride);
+      }
+      else
+      {
+        ret.kind = HeapMappingKind::Unresolved;
+      }
+
+      if(isCombined)
+      {
+        if(embedded)
+        {
+          ret.samplerKind = HeapMappingKind::EmbeddedSampler;
+        }
+        else if(samplerOk)
+        {
+          ret.samplerKind = HeapMappingKind::SamplerHeap;
+          ret.samplerByteOffset = uint64_t(samplerHeapOffset) +
+                                  uint64_t(samplerIndex) * samplerIndexStride +
+                                  (isArray ? 0 : shaderIndex * samplerArrayStride);
+        }
+        else
+        {
+          ret.samplerKind = HeapMappingKind::Unresolved;
+        }
+      }
+      break;
+    }
     case VK_DESCRIPTOR_MAPPING_SOURCE_INDIRECT_ADDRESS_EXT:
+    {
+      // indirectAddress = push data[pushOffset], resourceAddress = memory[indirectAddress + addressOffset]
+      uint64_t resourceAddress = 0;
+      if(ReadIndirect(pushData, pushDataSize, readMemory, src.indirectAddress.pushOffset,
+                      src.indirectAddress.addressOffset & ~7U, resourceAddress))
+      {
+        ret.kind = HeapMappingKind::IndirectAddress;
+        ret.byteOffset = src.indirectAddress.pushOffset;
+        ret.address = resourceAddress;
+      }
+      else
+      {
+        ret.kind = HeapMappingKind::Unresolved;
+      }
+      break;
+    }
     case VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_SHADER_RECORD_INDEX_EXT:
     case VK_DESCRIPTOR_MAPPING_SOURCE_SHADER_RECORD_DATA_EXT:
     case VK_DESCRIPTOR_MAPPING_SOURCE_SHADER_RECORD_ADDRESS_EXT:
     {
-      // these need device memory (or shader record) reads, a later task resolves them
+      // shader records are ray tracing only, which isn't supported
       ret.kind = HeapMappingKind::Unresolved;
 
       if(isCombined)

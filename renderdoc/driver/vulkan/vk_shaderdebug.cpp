@@ -201,6 +201,9 @@ public:
             return false;
           if(access.descriptorStore == heapStores[0] || access.descriptorStore == heapStores[1])
             return true;
+          // descriptors synthesised for mappings which aren't in a heap
+          if(access.descriptorStore == VulkanCreationInfo::heapSynthesisedStorage)
+            return true;
           auto samp = m_Creation.m_Sampler.find(access.descriptorStore);
           return samp != m_Creation.m_Sampler.end() && samp->second.embedded;
         });
@@ -2257,9 +2260,23 @@ private:
     if(typeMask == 0)
       return MappedResult::NotMapped;
 
+    // the indirect sources read through addresses in push data
+    const HeapMemoryReader reader = [this](uint64_t address, void *data, size_t size) {
+      // if the resources might be dirty from side-effects from the action, replay back to right
+      // before it.
+      if(m_ResourcesDirty)
+      {
+        VkMarkerRegion region("un-dirtying resources");
+        m_pDriver->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
+        m_ResourcesDirty = false;
+      }
+
+      return m_pDriver->GetReplay()->ReadDeviceMemory(address, data, size);
+    };
+
     const HeapMappingResult res = ResolveHeapMapping(
         m_HeapShader->descriptorMappings, set, binding, typeMask, index.arrayElement,
-        m_PushDataValid ? m_PushData.data() : NULL, m_PushData.size());
+        m_PushDataValid ? m_PushData.data() : NULL, m_PushData.size(), reader);
 
     Descriptor desc;
     SamplerDescriptor samp;
@@ -2308,9 +2325,58 @@ private:
       if(!FetchMappedSampler(access, res.kind, res.byteOffset, res.mappingIndex, samp))
         return MappedResult::Failed;
     }
+    else if(res.kind == HeapMappingKind::PushData && type == DescriptorType::ConstantBuffer)
+    {
+      // the uniform buffer's contents are in the push data, at an offset
+      DescriptorRange range;
+      range.offset = uint32_t(res.byteOffset);
+      range.descriptorSize = 1;
+      range.count = 1;
+      range.type = DescriptorType::ConstantBuffer;
+
+      rdcarray<Descriptor> descs =
+          m_pDriver->GetReplay()->GetDescriptors(m_pDriver->GetPushConstantCommandBuffer(), {range});
+      if(descs.empty())
+        return MappedResult::Failed;
+
+      desc = descs[0];
+    }
+    else if((res.kind == HeapMappingKind::PushAddress ||
+             res.kind == HeapMappingKind::IndirectAddress || res.kind == HeapMappingKind::HeapData) &&
+            (type == DescriptorType::ConstantBuffer || type == DescriptorType::Buffer ||
+             type == DescriptorType::ReadWriteBuffer))
+    {
+      // buffers at an address have no descriptor, make one that reads the buffer from there. Heap
+      // data is read at an offset from the resource heap itself
+      uint64_t address = res.address;
+
+      if(res.kind == HeapMappingKind::HeapData)
+      {
+        const VulkanRenderState &state = m_pDriver->GetRenderState();
+        address = state.resourceHeap.valid ? state.resourceHeap.address + res.byteOffset : 0;
+      }
+
+      // a uniform buffer is only as big as the block the shader declares
+      uint64_t declaredSize = 0;
+      if(type == DescriptorType::ConstantBuffer && index.index < refl->constantBlocks.size())
+        declaredSize = refl->constantBlocks[index.index].byteSize;
+
+      if(address == 0 ||
+         !m_pDriver->GetReplay()->MakeAddressDescriptor(type, address, declaredSize, desc))
+      {
+        m_pDriver->AddDebugMessage(
+            MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt("Couldn't find the buffer at address 0x%llx of mapped %s %u[%u] when "
+                              "%s.",
+                              address, ToStr(index.category).c_str(), index.index,
+                              index.arrayElement, access.c_str()));
+        return MappedResult::Failed;
+      }
+    }
     else
     {
-      // push data/address, heap data and indirect sources can't be resolved to a descriptor yet
+      // other sources can't be resolved to a descriptor (shader records, or the memory/push data to
+      // resolve them wasn't available)
       if(res.kind == HeapMappingKind::None)
         return MappedResult::NotMapped;
 

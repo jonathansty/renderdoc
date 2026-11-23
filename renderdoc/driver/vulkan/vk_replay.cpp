@@ -2732,20 +2732,42 @@ rdcarray<Descriptor> VulkanReplay::GetDescriptors(ResourceId descriptorStore,
   {
     const VulkanRenderState &state = m_pDriver->m_RenderState;
 
-    // should only be one descriptor referred here, but just munge them all to be the same
-    for(Descriptor &d : ret)
+    // push constants are always queried at offset 0 and implicitly view the whole data, since the
+    // ranges specified in the pipeline must match offsets declared in the shader. Uniform buffers
+    // mapped to push data by a descriptor heap pipeline start at an offset into the push data
+    size_t dst = 0;
+    for(const DescriptorRange &r : ranges)
     {
-      d.type = DescriptorType::ConstantBuffer;
-      d.flags = DescriptorFlags::InlineData;
-      d.view = ResourceId();
-      d.resource = descriptorStore;
-      // push constants also implicitly always view the whole data, since the ranges specified in
-      // the pipeline must match offsets declared in the shader
-      d.byteOffset = 0;
-      // we don't verify that the current command buffer is the one being requested - since push
-      // constants are not valid outside of the current event. We just pretend that all push
-      // constants are the same and mutable
-      d.byteSize = state.pushConstSize;
+      for(uint32_t i = 0; i < r.count; i++)
+      {
+        Descriptor &d = ret[dst++];
+
+        d.type = DescriptorType::ConstantBuffer;
+        d.flags = DescriptorFlags::InlineData;
+        d.view = ResourceId();
+        d.resource = descriptorStore;
+        d.byteOffset = r.offset;
+        // we don't verify that the current command buffer is the one being requested - since push
+        // constants are not valid outside of the current event. We just pretend that all push
+        // constants are the same and mutable
+        d.byteSize = state.pushConstSize > r.offset ? state.pushConstSize - r.offset : 0;
+      }
+    }
+
+    return ret;
+  }
+
+  // descriptors synthesised from descriptor heap mappings
+  if(descriptorStore == VulkanCreationInfo::heapSynthesisedStorage)
+  {
+    size_t dst = 0;
+    for(const DescriptorRange &r : ranges)
+    {
+      for(uint32_t i = 0; i < r.count; i++, dst++)
+      {
+        if(r.offset + i < m_SynthesisedDescriptors.size())
+          ret[dst] = m_SynthesisedDescriptors[r.offset + i].descriptor;
+      }
     }
 
     return ret;
@@ -2939,6 +2961,23 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
     return ret;
   }
 
+  // descriptors synthesised from descriptor heap mappings, which can include the sampler of a
+  // combined image sampler
+  if(descriptorStore == VulkanCreationInfo::heapSynthesisedStorage)
+  {
+    size_t dst = 0;
+    for(const DescriptorRange &r : ranges)
+    {
+      for(uint32_t i = 0; i < r.count; i++, dst++)
+      {
+        if(r.offset + i < m_SynthesisedDescriptors.size())
+          ret[dst] = m_SynthesisedDescriptors[r.offset + i].sampler;
+      }
+    }
+
+    return ret;
+  }
+
   // check for a descriptor buffer
   // (or a descriptor heap, which is decoded the same way but with different descriptor sizes)
   if(WrappedVkBuffer::IsAlloc(GetResourceManager()->GetResource(descriptorStore)) &&
@@ -3091,11 +3130,57 @@ rdcarray<SamplerDescriptor> VulkanReplay::GetSamplerDescriptors(ResourceId descr
   return ret;
 }
 
+bool VulkanReplay::ReadDeviceMemory(uint64_t address, void *data, size_t size)
+{
+  ResourceId id;
+  uint64_t offs = 0;
+  m_pDriver->GetResIDFromAddr(address, id, offs);
+
+  if(id == ResourceId())
+    return false;
+
+  bytebuf bytes;
+  GetBufferData(id, offs, size, bytes);
+
+  if(bytes.size() < size)
+    return false;
+
+  memcpy(data, bytes.data(), size);
+  return true;
+}
+
+bool VulkanReplay::MakeAddressDescriptor(DescriptorType type, uint64_t address, uint64_t byteSize,
+                                         Descriptor &out)
+{
+  ResourceId id;
+  uint64_t offs = 0;
+  m_pDriver->GetResIDFromAddr(address, id, offs);
+
+  if(id == ResourceId())
+    return false;
+
+  const uint64_t bufferSize = m_pDriver->m_CreationInfo.m_Buffer[id].size;
+  const uint64_t remaining = bufferSize > offs ? bufferSize - offs : 0;
+
+  out = Descriptor();
+  out.type = type;
+  out.resource = id;
+  out.byteOffset = offs;
+  out.byteSize = byteSize ? RDCMIN(byteSize, remaining) : remaining;
+
+  return true;
+}
+
 rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
 {
   const VulkanRenderState &state = m_pDriver->m_RenderState;
 
   rdcarray<DescriptorAccess> ret;
+
+  // synthesised descriptors are only referenced by the accesses returned from here, which are used
+  // immediately. Don't let the table grow forever as events are selected
+  if(m_SynthesisedDescriptors.size() > 2048)
+    m_SynthesisedDescriptors.clear();
 
   const ActionDescription *action = m_pDriver->GetAction(eventId);
   const bool compute = action && bool(action->flags & ActionFlags::Dispatch);
@@ -3170,10 +3255,24 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
       return;
 
     // push data shares storage with push constants, but is only meaningful if it was pushed with
-    // vkCmdPushDataEXT
-    const HeapMappingResult res =
-        ResolveHeapMapping(shad.descriptorMappings, set, bind, typeMask, access.arrayElement,
-                           state.pushDataHeap ? state.pushconsts : NULL, state.pushConstSize);
+    // vkCmdPushDataEXT. The indirect sources read through addresses in push data
+    const HeapMemoryReader reader = [this](uint64_t address, void *data, size_t size) {
+      return ReadDeviceMemory(address, data, size);
+    };
+
+    const HeapMappingResult res = ResolveHeapMapping(
+        shad.descriptorMappings, set, bind, typeMask, access.arrayElement,
+        state.pushDataHeap ? state.pushconsts : NULL, state.pushConstSize, reader);
+
+    // descriptors which aren't in a heap are synthesised and stored in a table, with a single store
+    // for all of them and the table index as the offset
+    auto synthesise = [this, &access](const Descriptor &desc, const SamplerDescriptor &samp,
+                                      const rdcstr &name) {
+      access.descriptorStore = VulkanCreationInfo::heapSynthesisedStorage;
+      access.byteOffset = (uint32_t)m_SynthesisedDescriptors.size();
+      access.byteSize = 1;
+      m_SynthesisedDescriptors.push_back({desc, samp, name});
+    };
 
     const VulkanRenderState::DescriptorHeapBind *heap = NULL;
     if(res.kind == HeapMappingKind::ResourceHeap)
@@ -3194,12 +3293,52 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
       return;
     }
 
-    // TODO(heap 5.6): push address, heap data and indirect sources are not resolved to a descriptor
-    // store yet. Uniform buffers backed by push data could be shown like
-    // push constants (store = GetPushConstantCommandBuffer()) once the UI handles the offset.
-    // The sampler part of a combined image sampler lives in the sampler heap which can't be
-    // expressed by a single access, so only the image part is reported (heap combined image
-    // sampler descriptors are image-only)
+    // uniform buffers backed by push data are shown like push constants, but with an offset into
+    // the push data
+    if(res.kind == HeapMappingKind::PushData)
+    {
+      access.descriptorStore = m_pDriver->GetPushConstantCommandBuffer();
+      access.byteOffset = uint32_t(res.byteOffset);
+      access.byteSize = 1;
+      return;
+    }
+
+    // buffers at an address (from push data, or read through an address in push data) and uniform
+    // buffers backed by the data of the resource heap have no descriptor to show, so a descriptor
+    // for the buffer is synthesised
+    if(res.kind == HeapMappingKind::PushAddress || res.kind == HeapMappingKind::IndirectAddress ||
+       res.kind == HeapMappingKind::HeapData)
+    {
+      uint64_t address = res.address;
+      const char *name =
+          res.kind == HeapMappingKind::PushAddress ? "Push Address" : "Indirect Address";
+
+      if(res.kind == HeapMappingKind::HeapData)
+      {
+        if(!state.resourceHeap.valid)
+          return;
+
+        address = state.resourceHeap.address + res.byteOffset;
+        name = "Heap Data";
+      }
+
+      // acceleration structures at an address aren't supported
+      if(access.type != DescriptorType::ConstantBuffer && access.type != DescriptorType::Buffer &&
+         access.type != DescriptorType::ReadWriteBuffer)
+        return;
+
+      // a uniform buffer is only as big as the block the shader declares
+      uint64_t declaredSize = 0;
+      if(access.type == DescriptorType::ConstantBuffer && shad.refl &&
+         access.index < shad.refl->constantBlocks.size())
+        declaredSize = shad.refl->constantBlocks[access.index].byteSize;
+
+      Descriptor desc;
+      if(address != 0 && MakeAddressDescriptor(access.type, address, declaredSize, desc))
+        synthesise(desc, SamplerDescriptor(), name);
+      return;
+    }
+
     if(heap == NULL || !heap->valid)
       return;
 
@@ -3209,6 +3348,57 @@ rdcarray<DescriptorAccess> VulkanReplay::GetDescriptorAccess(uint32_t eventId)
 
     if(id == ResourceId())
       return;
+
+    // the sampler part of a combined image sampler lives in the sampler heap (or is embedded), so
+    // a single access can't point at both. A descriptor is synthesised which has the image and
+    // the sampler together, as for a combined image sampler in a descriptor set
+    if(access.type == DescriptorType::ImageSampler)
+    {
+      DescriptorRange range;
+      range.offset = uint32_t(res.byteOffset + offs);
+      range.descriptorSize = m_pDriver->HeapDescriptorSize(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+      range.count = 1;
+      range.type = DescriptorType::Image;
+
+      rdcarray<Descriptor> descs = GetDescriptors(id, {range});
+      rdcarray<SamplerDescriptor> samps;
+
+      if(res.samplerKind == HeapMappingKind::EmbeddedSampler &&
+         res.mappingIndex < shad.descriptorMappings.size())
+      {
+        DescriptorRange sampRange;
+        sampRange.offset = 0;
+        sampRange.descriptorSize = 1;
+        sampRange.count = 1;
+        sampRange.type = DescriptorType::Sampler;
+
+        samps =
+            GetSamplerDescriptors(shad.descriptorMappings[res.mappingIndex].samplerId, {sampRange});
+      }
+      else if(res.samplerKind == HeapMappingKind::SamplerHeap && state.samplerHeap.valid)
+      {
+        ResourceId sampHeapId;
+        uint64_t sampOffs = 0;
+        m_pDriver->GetResIDFromAddr(state.samplerHeap.address, sampHeapId, sampOffs);
+
+        DescriptorRange sampRange;
+        sampRange.offset = uint32_t(res.samplerByteOffset + sampOffs);
+        sampRange.descriptorSize = m_pDriver->HeapDescriptorSize(VK_DESCRIPTOR_TYPE_SAMPLER);
+        sampRange.count = 1;
+        sampRange.type = DescriptorType::Sampler;
+
+        if(sampHeapId != ResourceId())
+          samps = GetSamplerDescriptors(sampHeapId, {sampRange});
+      }
+
+      if(!descs.empty())
+      {
+        descs[0].type = DescriptorType::ImageSampler;
+        synthesise(descs[0], samps.empty() ? SamplerDescriptor() : samps[0],
+                   "Combined Image Sampler");
+      }
+      return;
+    }
 
     access.descriptorStore = id;
     access.byteOffset = uint32_t(res.byteOffset + offs);
@@ -3448,6 +3638,26 @@ rdcarray<DescriptorLogicalLocation> VulkanReplay::GetDescriptorLocations(
       d.category = DescriptorCategory::ConstantBlock;
       d.fixedBindNumber = ~0U - 1;
       d.logicalBindName = "Push constants";
+    }
+
+    return ret;
+  }
+
+  // descriptors synthesised from descriptor heap mappings
+  if(descriptorStore == VulkanCreationInfo::heapSynthesisedStorage)
+  {
+    size_t dst = 0;
+    for(const DescriptorRange &r : ranges)
+    {
+      for(uint32_t i = 0; i < r.count; i++, dst++)
+      {
+        DescriptorLogicalLocation &l = ret[dst];
+
+        l.category = CategoryForDescriptorType(r.type);
+        l.fixedBindNumber = r.offset + i;
+        if(r.offset + i < m_SynthesisedDescriptors.size())
+          l.logicalBindName = m_SynthesisedDescriptors[r.offset + i].name;
+      }
     }
 
     return ret;
