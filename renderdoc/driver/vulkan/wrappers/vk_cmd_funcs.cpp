@@ -8708,6 +8708,49 @@ bool WrappedVulkan::Serialise_vkCmdBindShadersEXT(SerialiserType &ser,
       ObjDisp(commandBuffer)
           ->CmdBindShadersEXT(Unwrap(commandBuffer), stageCount, pStages,
                               UnwrapArray(pShaders, stageCount));
+
+      // replay enables all of the stage features the device supports, which the application might
+      // not have. Drawing with shader objects requires a (possibly NULL) shader to have been bound
+      // to every stage whose feature is enabled, so bind NULL to any such graphics stage that has
+      // never been bound in this command buffer
+      {
+        VulkanRenderState &renderstate = GetCmdRenderState();
+
+        bool graphicsBind = false;
+        for(uint32_t i = 0; i < stageCount; i++)
+          graphicsBind |= (StageIndex(pStages[i]) != (int)ShaderStage::Compute);
+
+        if(graphicsBind)
+        {
+          for(ShaderStage s : {ShaderStage::Tess_Control, ShaderStage::Tess_Eval,
+                               ShaderStage::Geometry, ShaderStage::Task, ShaderStage::Mesh})
+          {
+            if(renderstate.shaderObjects[(uint32_t)s] != ResourceId())
+              continue;
+
+            if((s == ShaderStage::Task || s == ShaderStage::Mesh) && !MeshShaders())
+              continue;
+
+            if((s == ShaderStage::Tess_Control || s == ShaderStage::Tess_Eval) &&
+               !GetDeviceEnabledFeatures().tessellationShader)
+              continue;
+
+            if(s == ShaderStage::Geometry && !GetDeviceEnabledFeatures().geometryShader)
+              continue;
+
+            bool bound = false;
+            for(uint32_t i = 0; i < stageCount; i++)
+              bound |= (StageIndex(pStages[i]) == (int)s);
+
+            if(bound)
+              continue;
+
+            const VkShaderStageFlagBits stage = (VkShaderStageFlagBits)(1 << (uint32_t)s);
+            const VkShaderEXT null = VK_NULL_HANDLE;
+            ObjDisp(commandBuffer)->CmdBindShadersEXT(Unwrap(commandBuffer), 1, &stage, &null);
+          }
+        }
+      }
     }
   }
 
